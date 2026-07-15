@@ -3,10 +3,14 @@ import {
   applyRemediation,
   establishTunnel,
   Finding,
+  getAppliedFindings,
   getRemediationLog,
+  getSetting,
   HandshakeResult,
   RemediationEntry,
+  rollbackRemediation,
   runScan,
+  setSetting,
 } from "./api";
 import Lattice from "./Lattice";
 
@@ -40,6 +44,7 @@ export default function App() {
   const [log, setLog] = useState<RemediationEntry[]>([]);
   const [localOnly, setLocalOnly] = useState(true);
   const [autoQueue, setAutoQueue] = useState(false);
+  const [onboardStep, setOnboardStep] = useState<number | null>(null);
 
   const scan = useCallback(async () => {
     setScanning(true);
@@ -63,8 +68,24 @@ export default function App() {
   useEffect(() => {
     scan();
     getRemediationLog().then(setLog).catch(() => {});
+    // Applied migrations persist in SQLite; restore their state on launch.
+    getAppliedFindings()
+      .then((ids) =>
+        setApplied(new Map(ids.map((id) => [id, "Migration applied — see remediation log"])))
+      )
+      .catch(() => {});
+    getSetting("onboarded")
+      .then((v) => {
+        if (v !== "1") setOnboardStep(0);
+      })
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const finishOnboarding = () => {
+    setSetting("onboarded", "1").catch(() => {});
+    setOnboardStep(null);
+  };
 
   const connect = async () => {
     if (shield === "protected") {
@@ -93,6 +114,20 @@ export default function App() {
       return next;
     });
 
+  const rollback = async (id: string) => {
+    try {
+      await rollbackRemediation(id);
+      setApplied((m) => {
+        const next = new Map(m);
+        next.delete(id);
+        return next;
+      });
+      setLog(await getRemediationLog());
+    } catch {
+      /* no snapshot — nothing to roll back */
+    }
+  };
+
   const applyQueue = async () => {
     setApplying(true);
     try {
@@ -120,9 +155,51 @@ export default function App() {
     [findings]
   );
 
+  const ONBOARD_STEPS = [
+    {
+      title: "Your laptop, quantum-safe",
+      body: "CryptiQ Personal inventories every cryptographic asset on this machine — SSH keys, GPG keys, disk encryption, Wi-Fi, certificates — and shows you exactly what a future quantum computer could break.",
+    },
+    {
+      title: "Nothing leaves this device",
+      body: "Your asset inventory, scan history, and remediation log live in a local database on this laptop. CryptiQ servers never see what's on your machine.",
+    },
+    {
+      title: "You approve every change",
+      body: "Fixable findings go into a queue. Nothing is migrated until you review and apply — and every applied migration keeps a snapshot so you can roll it back with one click.",
+    },
+  ];
+
   return (
     <div className="app" data-state={shield}>
       <Lattice state={shield} />
+
+      {onboardStep !== null && (
+        <div className="onboard">
+          <div className="onboard-card">
+            <div className="onboard-step">
+              {onboardStep + 1} / {ONBOARD_STEPS.length}
+            </div>
+            <h2>{ONBOARD_STEPS[onboardStep].title}</h2>
+            <p>{ONBOARD_STEPS[onboardStep].body}</p>
+            <div className="onboard-actions">
+              <button className="btn-ghost" onClick={finishOnboarding}>
+                Skip
+              </button>
+              <button
+                className="btn-primary"
+                onClick={() =>
+                  onboardStep + 1 < ONBOARD_STEPS.length
+                    ? setOnboardStep(onboardStep + 1)
+                    : finishOnboarding()
+                }
+              >
+                {onboardStep + 1 < ONBOARD_STEPS.length ? "Next" : "Run first scan"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <header className="topbar">
         <span className="wordmark">
@@ -217,7 +294,12 @@ export default function App() {
                     <span className="tgt">{f.target_crypto}</span>
                   </div>
                   {appliedMsg ? (
-                    <button className="chip done">Migrated</button>
+                    <span className="chip-pair">
+                      <button className="chip done">Migrated</button>
+                      <button className="chip rollback" onClick={() => rollback(f.id)}>
+                        Roll back
+                      </button>
+                    </span>
                   ) : f.remediation === "auto" ? (
                     <button
                       className={`chip ${queue.has(f.id) ? "queued" : "queue"}`}

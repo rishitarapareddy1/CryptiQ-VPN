@@ -1,6 +1,6 @@
 [package]
 name = "cryptiq-personal"
-version = "0.1.0"
+version = "0.2.0"
 description = "CryptiQ Personal — quantum-safe protection for your laptop"
 edition = "2021"
 
@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ml-kem = "0.2"
