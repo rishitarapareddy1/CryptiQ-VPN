@@ -32,6 +32,20 @@ one-click rollback.
 - **Wi-Fi policy** — flag untrusted (WPA2/open) networks as tunnel-required.
 - Applied state persists across app restarts.
 
+### Transparency
+- **Technical audit tab** — for every applied migration: the exact file changed
+  with a before/after line diff (reconstructed from the stored snapshot), the
+  generated key's fingerprint, and full handshake parameters (FIPS 203 sizes,
+  KDF construction, ciphertext preview).
+- **Manual findings carry fix instructions** — concrete steps shown inline for
+  everything the app can't safely change itself (FileVault, GPG, vendor certs…).
+
+### Distribution
+- `website/download.html` — drop-in download page for the CryptiQ site (real
+  SHA-256 checksum, first-launch instructions). Point the button at your CDN or
+  a public GitHub release asset.
+- Installer published at GitHub Releases (`gh release create vX.Y.Z <dmg>`).
+
 ### Product surface
 - Onboarding flow on first launch
 - Menu-bar tray icon (open / quit)

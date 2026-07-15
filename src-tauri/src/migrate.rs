@@ -7,6 +7,7 @@
 
 use crate::scanner;
 use crate::store::Store;
+use serde::Serialize;
 use std::path::PathBuf;
 
 const BLOCK_START: &str = "# >>> CryptiQ Personal managed block — do not edit >>>";
@@ -68,6 +69,72 @@ pub fn apply_wifi_policy(store: &Store, finding_id: &str) -> Result<String, Stri
         .to_string();
     store.log_remediation(finding_id, "wifi_policy", &msg);
     Ok(msg)
+}
+
+/// Full technical record of an applied migration, for the audit view:
+/// the exact file changed, its content before and after, and the fingerprint
+/// of any key material that was generated.
+#[derive(Serialize)]
+pub struct MigrationDetail {
+    pub finding_id: String,
+    pub action: String,
+    pub applied_at: String,
+    pub summary: String,
+    /// None for policy-only migrations (no file was touched).
+    pub file_path: Option<String>,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub new_key_path: Option<String>,
+    pub new_key_fingerprint: Option<String>,
+}
+
+pub fn migration_detail(store: &Store, finding_id: &str) -> Result<MigrationDetail, String> {
+    let entry = store
+        .latest_remediation(finding_id)
+        .ok_or("no applied migration for this finding")?;
+
+    let snap = store.latest_snapshot(finding_id);
+    let (file_path, before, after) = match snap {
+        Some(s) => {
+            let after = std::fs::read_to_string(&s.file_path).ok();
+            let before = s.content.map(|b| String::from_utf8_lossy(&b).to_string());
+            (Some(s.file_path), before, after)
+        }
+        None => (None, None, None),
+    };
+
+    // Fingerprint of the generated migration key, if this was an SSH migration.
+    let (new_key_path, new_key_fingerprint) = if entry.action == "ssh_migration" {
+        let pubkey = dirs::home_dir()
+            .map(|h| h.join(".ssh").join("cryptiq_ed25519.pub"))
+            .filter(|p| p.exists());
+        match pubkey {
+            Some(p) => {
+                let fp = std::process::Command::new("ssh-keygen")
+                    .args(["-l", "-f"])
+                    .arg(&p)
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+                (Some(p.to_string_lossy().to_string()), fp)
+            }
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(MigrationDetail {
+        finding_id: entry.finding_id,
+        action: entry.action,
+        applied_at: entry.applied_at,
+        summary: entry.detail,
+        file_path,
+        before,
+        after,
+        new_key_path,
+        new_key_fingerprint,
+    })
 }
 
 /// Roll back a previously applied migration by restoring the pre-change snapshot.

@@ -7,7 +7,7 @@
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{KemCore, MlKem768};
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use rand::rngs::OsRng;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,10 @@ pub struct HandshakeResult {
     pub session_fingerprint: String,
     pub kem_ciphertext_preview: String,
     pub kem_ciphertext_bytes: usize,
+    pub kem_encaps_key_bytes: usize,
+    pub kem_shared_secret_bytes: usize,
+    pub classical_shared_secret_bytes: usize,
+    pub kdf_label: String,
     pub duration_ms: f64,
 }
 
@@ -61,6 +65,7 @@ pub fn hybrid_handshake() -> Result<HandshakeResult, String> {
     let session_key = kdf.finalize();
 
     let ct_bytes: &[u8] = ct.as_slice();
+    let ek_encoded = ek.as_bytes();
     Ok(HandshakeResult {
         kem: "ML-KEM-768".into(),
         classical: "X25519".into(),
@@ -72,6 +77,10 @@ pub fn hybrid_handshake() -> Result<HandshakeResult, String> {
             .join(""),
         kem_ciphertext_preview: B64.encode(&ct_bytes[..36]),
         kem_ciphertext_bytes: ct_bytes.len(),
+        kem_encaps_key_bytes: ek_encoded.len(),
+        kem_shared_secret_bytes: ss_client.as_slice().len(),
+        classical_shared_secret_bytes: dh_client.as_bytes().len(),
+        kdf_label: "cryptiq-personal-hybrid-v1".into(),
         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
 }

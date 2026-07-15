@@ -18,7 +18,23 @@ export interface HandshakeResult {
   session_fingerprint: string;
   kem_ciphertext_preview: string;
   kem_ciphertext_bytes: number;
+  kem_encaps_key_bytes: number;
+  kem_shared_secret_bytes: number;
+  classical_shared_secret_bytes: number;
+  kdf_label: string;
   duration_ms: number;
+}
+
+export interface MigrationDetail {
+  finding_id: string;
+  action: string;
+  applied_at: string;
+  summary: string;
+  file_path: string | null;
+  before: string | null;
+  after: string | null;
+  new_key_path: string | null;
+  new_key_fingerprint: string | null;
 }
 
 export interface RemediationEntry {
@@ -36,6 +52,8 @@ export const applyRemediation = (findingId: string) =>
 export const rollbackRemediation = (findingId: string) =>
   invoke<string>("rollback_remediation", { findingId });
 export const getAppliedFindings = () => invoke<string[]>("get_applied_findings");
+export const getMigrationDetail = (findingId: string) =>
+  invoke<MigrationDetail>("get_migration_detail", { findingId });
 export const getRemediationLog = () => invoke<RemediationEntry[]>("get_remediation_log");
 export const getSetting = (key: string) => invoke<string | null>("get_setting", { key });
 export const setSetting = (key: string, value: string) =>
