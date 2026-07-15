@@ -173,6 +173,25 @@ impl Store {
         stmt.query_map([], |row| row.get(0)).unwrap().flatten().collect()
     }
 
+    pub fn latest_remediation(&self, finding_id: &str) -> Option<RemediationEntry> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT id, finding_id, action, detail, applied_at FROM remediations
+             WHERE finding_id = ?1 AND action != 'rollback' ORDER BY id DESC LIMIT 1",
+            params![finding_id],
+            |row| {
+                Ok(RemediationEntry {
+                    id: row.get(0)?,
+                    finding_id: row.get(1)?,
+                    action: row.get(2)?,
+                    detail: row.get(3)?,
+                    applied_at: row.get(4)?,
+                })
+            },
+        )
+        .ok()
+    }
+
     pub fn remediation_log(&self) -> Vec<RemediationEntry> {
         let conn = self.0.lock().unwrap();
         let mut stmt = conn

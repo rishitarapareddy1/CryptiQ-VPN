@@ -41,6 +41,14 @@ fn get_applied_findings(store: State<Store>) -> Vec<String> {
 }
 
 #[tauri::command]
+fn get_migration_detail(
+    store: State<Store>,
+    finding_id: String,
+) -> Result<migrate::MigrationDetail, String> {
+    migrate::migration_detail(&store, &finding_id)
+}
+
+#[tauri::command]
 fn get_remediation_log(store: State<Store>) -> Vec<RemediationEntry> {
     store.remediation_log()
 }
@@ -97,6 +105,7 @@ pub fn run() {
             apply_remediation,
             rollback_remediation,
             get_applied_findings,
+            get_migration_detail,
             get_remediation_log,
             get_setting,
             set_setting

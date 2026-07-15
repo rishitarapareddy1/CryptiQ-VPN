@@ -182,7 +182,48 @@ fn settings_upsert() {
     assert_eq!(store.get_setting("onboarded").as_deref(), Some("0"));
 }
 
-// ---------- 5. live scan of the machine running the tests ----------
+// ---------- 5. technical audit: migration detail ----------
+
+#[test]
+fn migration_detail_returns_before_and_after_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+
+    let file = dir.path().join("ssh_config");
+    std::fs::write(&file, "Host old\n\n# managed block\nIdentityFile new\n").unwrap();
+    store.save_snapshot("ssh:x.pub", &file.to_string_lossy(), Some("Host old\n"));
+    store.log_remediation("ssh:x.pub", "config_edit", "added managed block");
+
+    let d = cryptiq_personal_lib::migrate::migration_detail(&store, "ssh:x.pub").unwrap();
+    assert_eq!(d.finding_id, "ssh:x.pub");
+    assert_eq!(d.action, "config_edit");
+    assert_eq!(d.before.as_deref(), Some("Host old\n"));
+    assert_eq!(
+        d.after.as_deref(),
+        Some("Host old\n\n# managed block\nIdentityFile new\n")
+    );
+    assert_eq!(d.file_path.as_deref(), Some(&*file.to_string_lossy()));
+}
+
+#[test]
+fn migration_detail_errors_when_nothing_was_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+    assert!(cryptiq_personal_lib::migrate::migration_detail(&store, "ssh:ghost.pub").is_err());
+}
+
+#[test]
+fn handshake_exposes_full_fips203_parameters() {
+    let hs = cryptiq_personal_lib::pqc::hybrid_handshake().unwrap();
+    // FIPS 203 ML-KEM-768: encapsulation key 1184 B, ciphertext 1088 B, shared secret 32 B
+    assert_eq!(hs.kem_encaps_key_bytes, 1184);
+    assert_eq!(hs.kem_ciphertext_bytes, 1088);
+    assert_eq!(hs.kem_shared_secret_bytes, 32);
+    assert_eq!(hs.classical_shared_secret_bytes, 32);
+    assert_eq!(hs.kdf_label, "cryptiq-personal-hybrid-v1");
+}
+
+// ---------- 6. live scan of the machine running the tests ----------
 
 #[test]
 fn live_scan_of_this_machine() {

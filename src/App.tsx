@@ -13,9 +13,23 @@ import {
   setSetting,
 } from "./api";
 import Lattice from "./Lattice";
+import Technical from "./Technical";
 
 type ShieldState = "exposed" | "negotiating" | "protected";
-type Tab = "shield" | "assets" | "log" | "settings";
+type Tab = "shield" | "assets" | "technical" | "log" | "settings";
+
+/** Concrete fix steps for findings the app cannot safely change itself. */
+const GUIDANCE: [string, string][] = [
+  ["disk:filevault", "System Settings → Privacy & Security → FileVault → Turn On. Save the recovery key somewhere safe (not on this disk)."],
+  ["os:version", "System Settings → General → Software Update. macOS 14+ ships hybrid post-quantum TLS."],
+  ["git:signing", "Switch to SSH signing: git config --global gpg.format ssh && git config --global user.signingkey ~/.ssh/cryptiq_ed25519.pub"],
+  ["ssh:known_hosts", "Ask each server's admin to enable Ed25519 host keys (HostKey /etc/ssh/ssh_host_ed25519_key), then reconnect to refresh the entry."],
+  ["gpg:", "Generate a modern key: gpg --quick-generate-key \"You <you@email>\" ed25519 sign — then publish it and revoke the old key once contacts have switched."],
+  ["keychain:", "Open Keychain Access, sort certificates by key size, delete ones you don't recognize; for ones tied to an app, ask that vendor to reissue."],
+];
+
+const guidanceFor = (id: string) =>
+  GUIDANCE.find(([prefix]) => id.startsWith(prefix))?.[1] ?? null;
 
 const STATE_COPY: Record<ShieldState, { word: string; sub: string }> = {
   exposed: {
@@ -206,7 +220,7 @@ export default function App() {
           Crypti<b>Q</b> Personal
         </span>
         <nav className="nav">
-          {(["shield", "assets", "log", "settings"] as Tab[]).map((t) => (
+          {(["shield", "assets", "technical", "log", "settings"] as Tab[]).map((t) => (
             <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>
               {t}
             </button>
@@ -285,6 +299,9 @@ export default function App() {
                   <div>
                     <div className="name">{f.name}</div>
                     <div className="detail">{appliedMsg ?? f.detail}</div>
+                    {f.remediation === "manual" && guidanceFor(f.id) && (
+                      <div className="guidance">How to fix: {guidanceFor(f.id)}</div>
+                    )}
                   </div>
                   <div className="crypto">
                     <span className={appliedMsg ? "applied-old" : `cur ${f.severity === "critical" ? "bad" : ""}`}>
@@ -330,6 +347,10 @@ export default function App() {
               </div>
             )}
           </div>
+        )}
+
+        {tab === "technical" && (
+          <Technical appliedIds={[...applied.keys()]} handshake={handshake} />
         )}
 
         {tab === "log" && (
