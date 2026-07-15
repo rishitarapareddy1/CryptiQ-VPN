@@ -18,6 +18,12 @@ pub struct RemediationEntry {
     pub applied_at: String,
 }
 
+pub struct Snapshot {
+    pub file_path: String,
+    /// None means the file did not exist before the migration.
+    pub content: Option<Vec<u8>>,
+}
+
 fn db_path() -> PathBuf {
     let dir = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -58,6 +64,17 @@ pub fn open_at(path: &std::path::Path) -> Store {
             action TEXT NOT NULL,
             detail TEXT NOT NULL,
             applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            finding_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            content BLOB,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );",
     )
     .expect("failed to run migrations");
@@ -95,6 +112,65 @@ impl Store {
             params![finding_id, action, detail],
         )
         .ok();
+    }
+
+    pub fn save_snapshot(&self, finding_id: &str, file_path: &str, content: Option<&str>) {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (finding_id, file_path, content) VALUES (?1, ?2, ?3)",
+            params![finding_id, file_path, content.map(|c| c.as_bytes())],
+        )
+        .ok();
+    }
+
+    pub fn latest_snapshot(&self, finding_id: &str) -> Option<Snapshot> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT file_path, content FROM snapshots WHERE finding_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![finding_id],
+            |row| {
+                Ok(Snapshot {
+                    file_path: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )
+        .ok();
+    }
+
+    pub fn get_setting(&self, key: &str) -> Option<String> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Finding ids whose most recent remediation action is not a rollback —
+    /// i.e. migrations that are currently in effect. Lets the UI show applied
+    /// state across app restarts.
+    pub fn applied_findings(&self) -> Vec<String> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT finding_id FROM remediations r1
+                 WHERE id = (SELECT MAX(id) FROM remediations r2 WHERE r2.finding_id = r1.finding_id)
+                   AND action != 'rollback'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0)).unwrap().flatten().collect()
     }
 
     pub fn remediation_log(&self) -> Vec<RemediationEntry> {

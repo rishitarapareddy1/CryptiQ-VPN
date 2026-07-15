@@ -33,4 +33,10 @@ export const runScan = () => invoke<Finding[]>("run_scan");
 export const establishTunnel = () => invoke<HandshakeResult>("establish_tunnel");
 export const applyRemediation = (findingId: string) =>
   invoke<string>("apply_remediation", { findingId });
+export const rollbackRemediation = (findingId: string) =>
+  invoke<string>("rollback_remediation", { findingId });
+export const getAppliedFindings = () => invoke<string[]>("get_applied_findings");
 export const getRemediationLog = () => invoke<RemediationEntry[]>("get_remediation_log");
+export const getSetting = (key: string) => invoke<string | null>("get_setting", { key });
+export const setSetting = (key: string, value: string) =>
+  invoke<void>("set_setting", { key, value });

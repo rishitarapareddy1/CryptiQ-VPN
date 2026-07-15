@@ -28,6 +28,16 @@ pub fn run_full_scan() -> Vec<Finding> {
     if let Some(f) = scan_git_signing() {
         findings.push(f);
     }
+    if let Some(f) = scan_known_hosts() {
+        findings.push(f);
+    }
+    findings.extend(scan_gpg_keys());
+    if let Some(f) = scan_wifi() {
+        findings.push(f);
+    }
+    if let Some(f) = scan_keychain_certs() {
+        findings.push(f);
+    }
     findings
 }
 
@@ -241,6 +251,223 @@ fn scan_git_signing() -> Option<Finding> {
             remediation: "manual".into(),
         })
     }
+}
+
+/// Host keys in ~/.ssh/known_hosts still using ssh-rsa — an aggregate finding,
+/// since the fix is on the server side of each connection.
+fn scan_known_hosts() -> Option<Finding> {
+    let path = dirs::home_dir()?.join(".ssh").join("known_hosts");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let total = content.lines().filter(|l| !l.trim().is_empty()).count();
+    if total == 0 {
+        return None;
+    }
+    let weak = content
+        .lines()
+        .filter(|l| l.contains(" ssh-rsa ") || l.contains(" ssh-dss "))
+        .count();
+
+    Some(if weak > 0 {
+        Finding {
+            id: "ssh:known_hosts".into(),
+            category: "SSH".into(),
+            name: "Known hosts (server keys)".into(),
+            detail: format!(
+                "{weak} of {total} remembered servers present RSA/DSA host keys. \
+                 The fix is server-side; reconnecting after servers upgrade refreshes these."
+            ),
+            severity: "warn".into(),
+            current_crypto: format!("{weak}× ssh-rsa/dss"),
+            target_crypto: "ssh-ed25519".into(),
+            remediation: "manual".into(),
+        }
+    } else {
+        Finding {
+            id: "ssh:known_hosts".into(),
+            category: "SSH".into(),
+            name: "Known hosts (server keys)".into(),
+            detail: format!("All {total} remembered server keys use modern algorithms"),
+            severity: "ok".into(),
+            current_crypto: "ssh-ed25519 / ecdsa".into(),
+            target_crypto: "ssh-ed25519".into(),
+            remediation: "none".into(),
+        }
+    })
+}
+
+/// GPG keyring, if gpg is installed. Colon format: pub line field 4 is the
+/// algorithm id (1/2/3 = RSA, 16/17 = ElGamal/DSA, 18 = ECDH, 19 = ECDSA, 22 = EdDSA).
+fn scan_gpg_keys() -> Vec<Finding> {
+    let out = match Command::new("gpg")
+        .args(["--list-keys", "--with-colons"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(), // gpg not installed or no keyring — not a finding
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut findings = Vec::new();
+    for line in text.lines().filter(|l| l.starts_with("pub:")) {
+        let fields: Vec<&str> = line.split(':').collect();
+        let bits = fields.get(2).unwrap_or(&"?");
+        let algo_id: u32 = fields.get(3).and_then(|a| a.parse().ok()).unwrap_or(0);
+        let key_id = fields.get(4).map(|k| k.to_string()).unwrap_or_default();
+        let short_id = key_id.chars().rev().take(8).collect::<String>().chars().rev().collect::<String>();
+
+        let (severity, current) = match algo_id {
+            1..=3 => ("warn", format!("RSA-{bits}")),
+            16 | 17 => ("critical", format!("DSA/ElGamal-{bits}")),
+            18 | 19 => ("warn", "ECC (NIST)".to_string()),
+            22 => ("ok", "EdDSA (Ed25519)".to_string()),
+            _ => ("warn", format!("algo #{algo_id}")),
+        };
+        findings.push(Finding {
+            id: format!("gpg:{key_id}"),
+            category: "GPG".into(),
+            name: format!("GPG key …{short_id}"),
+            detail: if severity == "ok" {
+                "Modern curve signature; quantum-safe GPG requires a future ML-DSA-capable release".into()
+            } else {
+                "Quantum-breakable public key in your GPG keyring. Generate an Ed25519 GPG key and re-sign; revoke this one when peers have migrated.".into()
+            },
+            severity: severity.into(),
+            current_crypto: current,
+            target_crypto: "Ed25519 (GPG) → ML-DSA when supported".into(),
+            remediation: "manual".into(),
+        });
+    }
+    findings
+}
+
+/// Security mode of the Wi-Fi network the laptop is currently on.
+fn scan_wifi() -> Option<Finding> {
+    let out = Command::new("system_profiler")
+        .args(["SPAirPortDataType", "-detailLevel", "basic"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // The current network block appears under "Current Network Information:";
+    // its "Security:" line is the first one after that marker.
+    let after = text.split("Current Network Information:").nth(1)?;
+    let security = after
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Security:").map(|s| s.trim().to_string()))?;
+
+    let (severity, remediation, detail) = if security.contains("WPA3") {
+        ("ok", "none", "WPA3 uses SAE — strong against offline capture".to_string())
+    } else if security.contains("WPA2") {
+        (
+            "warn",
+            "auto",
+            "WPA2 traffic can be captured today and decrypted later. The CryptiQ tunnel wraps it in quantum-safe encryption.".to_string(),
+        )
+    } else if security.to_lowercase().contains("none") || security.contains("Open") {
+        (
+            "critical",
+            "auto",
+            "Open network — all traffic visible. Tunnel required.".to_string(),
+        )
+    } else {
+        ("warn", "auto", format!("Legacy security mode: {security}"))
+    };
+
+    Some(Finding {
+        id: "net:wifi".into(),
+        category: "Network".into(),
+        name: "Current Wi-Fi network".into(),
+        detail,
+        severity: severity.into(),
+        current_crypto: security,
+        target_crypto: "ML-KEM-768 tunnel".into(),
+        remediation: remediation.into(),
+    })
+}
+
+/// Aggregate look at certificates in the login Keychain: how many carry
+/// weak (<2048-bit) RSA public keys.
+fn scan_keychain_certs() -> Option<Finding> {
+    let home = dirs::home_dir()?;
+    let keychain = home.join("Library/Keychains/login.keychain-db");
+    let out = Command::new("security")
+        .args(["find-certificate", "-a", "-p"])
+        .arg(&keychain)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pem = String::from_utf8_lossy(&out.stdout);
+    let certs: Vec<String> = pem
+        .split("-----END CERTIFICATE-----")
+        .filter(|c| c.contains("-----BEGIN CERTIFICATE-----"))
+        .map(|c| format!("{c}-----END CERTIFICATE-----\n"))
+        .collect();
+    if certs.is_empty() {
+        return None;
+    }
+
+    let mut weak = 0usize;
+    for cert in &certs {
+        // `openssl x509 -text` prints e.g. "Public-Key: (1024 bit)" with "rsaEncryption".
+        use std::io::Write;
+        use std::process::Stdio;
+        let Ok(mut child) = Command::new("openssl")
+            .args(["x509", "-noout", "-text"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return None; // no openssl — skip this scanner entirely
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(cert.as_bytes()).ok();
+        }
+        if let Ok(o) = child.wait_with_output() {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            let is_rsa = txt.contains("rsaEncryption");
+            let bits = txt
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("Public-Key: (")
+                        .and_then(|r| r.split_whitespace().next())
+                        .and_then(|b| b.parse::<u32>().ok())
+                })
+                .unwrap_or(0);
+            if is_rsa && bits > 0 && bits < 2048 {
+                weak += 1;
+            }
+        }
+    }
+
+    Some(if weak > 0 {
+        Finding {
+            id: "keychain:certs".into(),
+            category: "Keychain".into(),
+            name: "Login Keychain certificates".into(),
+            detail: format!(
+                "{weak} of {} certificates carry RSA keys under 2048 bits — breakable classically soon, quantum-trivial. These belong to the apps/services that issued them; remove or ask the vendor to reissue.",
+                certs.len()
+            ),
+            severity: "warn".into(),
+            current_crypto: format!("{weak}× RSA<2048"),
+            target_crypto: "RSA-3072+ / ECDSA → ML-DSA".into(),
+            remediation: "manual".into(),
+        }
+    } else {
+        Finding {
+            id: "keychain:certs".into(),
+            category: "Keychain".into(),
+            name: "Login Keychain certificates".into(),
+            detail: format!("All {} certificates use ≥2048-bit keys", certs.len()),
+            severity: "ok".into(),
+            current_crypto: "RSA-2048+ / ECDSA".into(),
+            target_crypto: "ML-DSA when CAs issue it".into(),
+            remediation: "none".into(),
+        }
+    })
 }
 
 /// The one remediation v1 performs for real, and it is non-destructive:

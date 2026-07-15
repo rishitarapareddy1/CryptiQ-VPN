@@ -423,6 +423,69 @@ body {
 .toggle.on { background: var(--accent-soft); border-color: var(--accent); }
 .toggle.on::after { transform: translateX(18px); background: var(--accent); }
 
+.chip-pair {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.chip.rollback {
+  color: var(--ink-dim);
+}
+
+.chip.rollback:hover {
+  color: #ff8a95;
+  border-color: rgba(255, 77, 94, 0.4);
+}
+
+/* ---- onboarding ---- */
+.onboard {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 6, 10, 0.82);
+  backdrop-filter: blur(18px);
+}
+
+.onboard-card {
+  max-width: 480px;
+  padding: 44px 48px;
+  border: 1px solid var(--hairline);
+  border-radius: 18px;
+  background: rgba(12, 16, 24, 0.95);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55);
+}
+
+.onboard-step {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.25em;
+  color: var(--accent);
+  margin-bottom: 16px;
+}
+
+.onboard-card h2 {
+  font-size: 26px;
+  font-weight: 300;
+  margin-bottom: 14px;
+}
+
+.onboard-card p {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--ink-dim);
+}
+
+.onboard-actions {
+  margin-top: 30px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
 .empty {
   padding: 60px 0;
   text-align: center;

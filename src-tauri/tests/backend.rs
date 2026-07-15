@@ -124,7 +124,65 @@ fn store_records_scans_and_remediations() {
     assert!(db.exists(), "database file must exist on disk");
 }
 
-// ---------- 4. live scan of the machine running the tests ----------
+// ---------- 4. snapshots, applied-state, and rollback bookkeeping ----------
+
+#[test]
+fn snapshot_round_trip_preserves_exact_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+
+    store.save_snapshot("ssh:demo.pub", "/tmp/fake_config", Some("Host old\n  User me\n"));
+    let snap = store.latest_snapshot("ssh:demo.pub").expect("snapshot must exist");
+    assert_eq!(snap.file_path, "/tmp/fake_config");
+    assert_eq!(snap.content.as_deref(), Some("Host old\n  User me\n".as_bytes()));
+
+    // None content = file did not exist before migration
+    store.save_snapshot("ssh:other.pub", "/tmp/never_existed", None);
+    let snap2 = store.latest_snapshot("ssh:other.pub").unwrap();
+    assert!(snap2.content.is_none());
+}
+
+#[test]
+fn applied_findings_tracks_latest_action_and_rollback_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+
+    store.log_remediation("ssh:a.pub", "ssh_migration", "migrated");
+    store.log_remediation("net:wifi", "wifi_policy", "policy on");
+    let mut applied = store.applied_findings();
+    applied.sort();
+    assert_eq!(applied, vec!["net:wifi", "ssh:a.pub"]);
+
+    // Rolling back removes it from the applied set — latest action wins.
+    store.log_remediation("ssh:a.pub", "rollback", "restored");
+    assert_eq!(store.applied_findings(), vec!["net:wifi"]);
+}
+
+#[test]
+fn wifi_policy_applies_and_rolls_back_via_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+
+    cryptiq_personal_lib::migrate::apply_wifi_policy(&store, "net:wifi").unwrap();
+    assert_eq!(store.get_setting("force_tunnel_untrusted").as_deref(), Some("1"));
+    assert_eq!(store.applied_findings(), vec!["net:wifi"]);
+
+    cryptiq_personal_lib::migrate::rollback(&store, "net:wifi").unwrap();
+    assert_eq!(store.get_setting("force_tunnel_untrusted").as_deref(), Some("0"));
+    assert!(store.applied_findings().is_empty());
+}
+
+#[test]
+fn settings_upsert() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+    assert!(store.get_setting("onboarded").is_none());
+    store.set_setting("onboarded", "1");
+    store.set_setting("onboarded", "0");
+    assert_eq!(store.get_setting("onboarded").as_deref(), Some("0"));
+}
+
+// ---------- 5. live scan of the machine running the tests ----------
 
 #[test]
 fn live_scan_of_this_machine() {
