@@ -2,10 +2,12 @@ pub mod migrate;
 pub mod pqc;
 pub mod scanner;
 pub mod store;
+pub mod tunnel;
 
 use scanner::Finding;
 use store::{RemediationEntry, Store};
 use tauri::State;
+use tunnel::{TunnelManager, TunnelStatus};
 
 #[tauri::command]
 fn run_scan(store: State<Store>) -> Vec<Finding> {
@@ -14,9 +16,30 @@ fn run_scan(store: State<Store>) -> Vec<Finding> {
     findings
 }
 
+/// Back-compat: offline in-process handshake (no edge, no WireGuard).
 #[tauri::command]
 fn establish_tunnel() -> Result<pqc::HandshakeResult, String> {
     pqc::hybrid_handshake()
+}
+
+#[tauri::command]
+fn connect_tunnel(
+    tunnels: State<TunnelManager>,
+    store: State<Store>,
+    edge_url: Option<String>,
+) -> Result<TunnelStatus, String> {
+    let url = edge_url.or_else(|| store.get_setting("edge_url"));
+    tunnels.connect(url)
+}
+
+#[tauri::command]
+fn disconnect_tunnel(tunnels: State<TunnelManager>) -> Result<TunnelStatus, String> {
+    tunnels.disconnect()
+}
+
+#[tauri::command]
+fn tunnel_status(tunnels: State<TunnelManager>) -> TunnelStatus {
+    tunnels.status()
 }
 
 #[tauri::command]
@@ -95,6 +118,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .manage(store::open())
+        .manage(tunnel::TunnelManager::new())
         .setup(|app| {
             setup_tray(app)?;
             Ok(())
@@ -102,6 +126,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             run_scan,
             establish_tunnel,
+            connect_tunnel,
+            disconnect_tunnel,
+            tunnel_status,
             apply_remediation,
             rollback_remediation,
             get_applied_findings,

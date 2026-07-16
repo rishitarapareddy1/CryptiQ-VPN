@@ -7,77 +7,68 @@ one-click rollback.
 
 ## What works in this build
 
+### Tunnel (v0.4)
+- **Networked hybrid handshake** with a CryptiQ edge: ML-KEM-768 + X25519 over
+  HTTP, then WireGuard peer exchange authenticated by the shared session key
+  (`src-tauri/src/pqc.rs`, `src-tauri/src/tunnel.rs`).
+- **Local edge peer** (`edge/`) — run with `cargo run --manifest-path edge/Cargo.toml`.
+  Assigns VPN IPs (`10.66.66.N`) and writes `edge/wg-cryptiq.conf`.
+- Client writes a WireGuard config after a successful handshake and attempts
+  `wg-quick up`. Without admin rights you still get a valid config to import
+  into the WireGuard app (`state=config_ready`).
+- Shield button talks to the edge URL from Settings (default `http://127.0.0.1:8787`).
+
 ### Crypto
-- **Hybrid post-quantum handshake** (`src-tauri/src/pqc.rs`) — real ML-KEM-768
-  (FIPS 203) lattice key encapsulation combined with X25519 ECDH through a
-  SHA-256 KDF. Both sides currently run in-process; the WireGuard transport to
-  edge nodes is the remaining piece.
+- Real ML-KEM-768 (FIPS 203) lattice key encapsulation + X25519 through a
+  SHA-256 hybrid KDF. Offline in-process handshake still available for tests.
 
 ### Scanners (`src-tauri/src/scanner.rs`) — all read real machine state
-- SSH keys in `~/.ssh` — algorithm + bit length (RSA/DSA/ECDSA flagged)
-- SSH `known_hosts` — servers still presenting RSA/DSA host keys
-- GPG keyring — RSA/DSA/ElGamal keys flagged (if gpg installed)
-- FileVault disk-encryption status
-- Current Wi-Fi network security mode (WPA3 / WPA2 / open)
-- Login Keychain certificates with weak (<2048-bit) RSA keys
-- macOS version / system TLS post-quantum support
-- Git commit-signing configuration
+- SSH keys, `known_hosts`, GPG keyring, FileVault, Wi-Fi, Keychain certs,
+  OS TLS stack, Git commit signing
 
 ### Migration engine (`src-tauri/src/migrate.rs`)
-- **SSH migration** — generates an Ed25519 keypair at `~/.ssh/cryptiq_ed25519`
-  and wires it into `~/.ssh/config` via a clearly-marked managed block. Original
-  keys and config are never deleted.
-- **Snapshots + rollback** — the exact pre-migration file content is stored in
-  SQLite before any change; every applied migration has a working Roll back button.
-- **Wi-Fi policy** — flag untrusted (WPA2/open) networks as tunnel-required.
-- Applied state persists across app restarts.
+- SSH migration with managed `~/.ssh/config` block, snapshots + rollback,
+  Wi-Fi force-tunnel policy
 
 ### Transparency
-- **Technical audit tab** — for every applied migration: the exact file changed
-  with a before/after line diff (reconstructed from the stored snapshot), the
-  generated key's fingerprint, and full handshake parameters (FIPS 203 sizes,
-  KDF construction, ciphertext preview).
-- **Manual findings carry fix instructions** — concrete steps shown inline for
-  everything the app can't safely change itself (FileVault, GPG, vendor certs…).
-
-### Distribution
-- `website/download.html` — drop-in download page for the CryptiQ site (real
-  SHA-256 checksum, first-launch instructions). Point the button at your CDN or
-  a public GitHub release asset.
-- Installer published at GitHub Releases (`gh release create vX.Y.Z <dmg>`).
+- Technical audit tab (before/after diffs, key fingerprints, handshake params)
+- Manual findings with inline fix instructions
 
 ### Product surface
-- Onboarding flow on first launch
-- Menu-bar tray icon (open / quit)
-- State-driven UI: Exposed / Negotiating / Protected
-- On-device SQLite at `~/Library/Application Support/CryptiQ Personal/cryptiq.db` —
-  inventory, scan history, remediation log, snapshots, settings. Nothing leaves
-  the device.
+- Onboarding, tray icon, on-device SQLite, download page under `website/`
 
 ## Run it
 
 ```bash
+# terminal 1 — local edge
+cargo run --manifest-path edge/Cargo.toml
+
+# terminal 2 — optional: bring up the edge WireGuard interface
+sudo wg-quick up ./edge/wg-cryptiq.conf
+
+# terminal 3 — app
 npm install
-npm run tauri dev      # development
-npm run tauri build    # produces .app and .dmg installer
+npm run tauri dev
 ```
 
-Requires Rust (`rustup`) and Node 18+.
+Then hit **Connect quantum-safe tunnel** on the Shield tab.
+
+Requires Rust (`rustup`), Node 18+, and (for the interface) `brew install wireguard-tools`.
 
 ## Tests
 
 ```bash
 cd src-tauri && cargo test
+# live against a running edge:
+CRYPTIQ_WG_DIR=/tmp/cryptiq-wg cargo run --example live_edge
 ```
 
-12 integration tests: handshake correctness (incl. FIPS 203 ciphertext size),
-SSH key classification against real `ssh-keygen`-generated keys, SQLite
-round-trips, snapshot/rollback bookkeeping, and a live scan of the host machine.
+## Honest limits
 
-## Not built yet
-
-- WireGuard transport (needs Apple Network Extension entitlement + edge servers)
-- Code signing + notarization (needs an Apple Developer account) — unsigned
-  builds require right-click → Open on first launch
-- Accounts / billing / cross-device sync (cloud Postgres side)
-- Auto-update
+- WireGuard *data plane* is still classical Curve25519 (industry standard). The
+  PQ layer protects the *control plane* (how peers learn each other's keys).
+- Full-device traffic routing (`AllowedIPs = 0.0.0.0/0`) and a production edge
+  fleet are not in this build — local edge is for development.
+- Bringing the interface up on macOS needs admin / the WireGuard app; unsigned
+  builds still need Gatekeeper "Open Anyway".
+- Accounts / billing / notarization still ahead.

@@ -2,6 +2,8 @@ node_modules/
 dist/
 .vite/
 release/
+edge/target/
+edge/wg-cryptiq.conf
 src-tauri/target/
 src-tauri/gen/
 .DS_Store

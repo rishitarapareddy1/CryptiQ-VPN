@@ -25,6 +25,17 @@ export interface HandshakeResult {
   duration_ms: number;
 }
 
+export interface TunnelStatus {
+  state: "down" | "handshaking" | "up" | "config_ready";
+  handshake: HandshakeResult | null;
+  edge_url: string;
+  config_path: string | null;
+  client_vpn_ip: string | null;
+  endpoint: string | null;
+  message: string;
+  transport: "wireguard" | "handshake_only";
+}
+
 export interface MigrationDetail {
   finding_id: string;
   action: string;
@@ -47,6 +58,10 @@ export interface RemediationEntry {
 
 export const runScan = () => invoke<Finding[]>("run_scan");
 export const establishTunnel = () => invoke<HandshakeResult>("establish_tunnel");
+export const connectTunnel = (edgeUrl?: string) =>
+  invoke<TunnelStatus>("connect_tunnel", { edgeUrl: edgeUrl ?? null });
+export const disconnectTunnel = () => invoke<TunnelStatus>("disconnect_tunnel");
+export const tunnelStatus = () => invoke<TunnelStatus>("tunnel_status");
 export const applyRemediation = (findingId: string) =>
   invoke<string>("apply_remediation", { findingId });
 export const rollbackRemediation = (findingId: string) =>
