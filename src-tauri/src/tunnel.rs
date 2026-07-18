@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const DEFAULT_EDGE: &str = "http://127.0.0.1:8787";
+const DEFAULT_EDGE: &str = "http://64.181.224.148:8787";
 const IFACE: &str = "utuncryptiq";
 
 #[derive(Serialize, Clone, Debug)]

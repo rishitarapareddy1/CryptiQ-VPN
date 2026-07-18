@@ -1,7 +1,9 @@
 fn main() {
     let full_tunnel = std::env::args().any(|a| a == "--full-tunnel");
+    let edge =
+        std::env::var("CRYPTIQ_EDGE_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".into());
     let tm = cryptiq_personal_lib::tunnel::TunnelManager::new();
-    match tm.connect(Some("http://127.0.0.1:8787".into()), full_tunnel) {
+    match tm.connect(Some(edge), full_tunnel) {
         Ok(s) => {
             println!("OK state={} transport={} routing={}", s.state, s.transport, s.routing);
             println!(

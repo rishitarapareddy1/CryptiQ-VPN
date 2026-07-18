@@ -53,7 +53,7 @@ export default function App() {
   const [shield, setShield] = useState<ShieldState>("exposed");
   const [handshake, setHandshake] = useState<HandshakeResult | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
-  const [edgeUrl, setEdgeUrl] = useState("http://127.0.0.1:8787");
+  const [edgeUrl, setEdgeUrl] = useState("http://64.181.224.148:8787");
   const [tunnelError, setTunnelError] = useState<string | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [scanning, setScanning] = useState(false);
@@ -415,8 +415,10 @@ export default function App() {
               <div>
                 <div className="s-name">Edge URL</div>
                 <div className="s-desc">
-                  CryptiQ edge that speaks the hybrid handshake. Default is a local edge for
-                  development: run <span className="mono-inline">cargo run --manifest-path edge/Cargo.toml</span>
+                  CryptiQ edge that speaks the hybrid handshake. Default is the public CryptiQ
+                  edge; for local development run{" "}
+                  <span className="mono-inline">cargo run --manifest-path edge/Cargo.toml</span>{" "}
+                  and set this to <span className="mono-inline">http://127.0.0.1:8787</span>
                 </div>
               </div>
               <span className="spacer" />
