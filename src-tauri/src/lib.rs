@@ -27,9 +27,16 @@ fn connect_tunnel(
     tunnels: State<TunnelManager>,
     store: State<Store>,
     edge_url: Option<String>,
+    full_tunnel: Option<bool>,
 ) -> Result<TunnelStatus, String> {
     let url = edge_url.or_else(|| store.get_setting("edge_url"));
-    tunnels.connect(url)
+    let full = full_tunnel.unwrap_or_else(|| {
+        store
+            .get_setting("full_tunnel")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
+    });
+    tunnels.connect(url, full)
 }
 
 #[tauri::command]

@@ -34,6 +34,7 @@ export interface TunnelStatus {
   endpoint: string | null;
   message: string;
   transport: "wireguard" | "handshake_only";
+  routing: "peer_only" | "full_tunnel";
 }
 
 export interface MigrationDetail {
@@ -58,8 +59,11 @@ export interface RemediationEntry {
 
 export const runScan = () => invoke<Finding[]>("run_scan");
 export const establishTunnel = () => invoke<HandshakeResult>("establish_tunnel");
-export const connectTunnel = (edgeUrl?: string) =>
-  invoke<TunnelStatus>("connect_tunnel", { edgeUrl: edgeUrl ?? null });
+export const connectTunnel = (edgeUrl?: string, fullTunnel?: boolean) =>
+  invoke<TunnelStatus>("connect_tunnel", {
+    edgeUrl: edgeUrl ?? null,
+    fullTunnel: fullTunnel ?? null,
+  });
 export const disconnectTunnel = () => invoke<TunnelStatus>("disconnect_tunnel");
 export const tunnelStatus = () => invoke<TunnelStatus>("tunnel_status");
 export const applyRemediation = (findingId: string) =>

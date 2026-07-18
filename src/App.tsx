@@ -63,6 +63,7 @@ export default function App() {
   const [log, setLog] = useState<RemediationEntry[]>([]);
   const [localOnly, setLocalOnly] = useState(true);
   const [autoQueue, setAutoQueue] = useState(false);
+  const [fullTunnel, setFullTunnel] = useState(false);
   const [onboardStep, setOnboardStep] = useState<number | null>(null);
 
   const scan = useCallback(async () => {
@@ -103,6 +104,9 @@ export default function App() {
         if (v) setEdgeUrl(v);
       })
       .catch(() => {});
+    getSetting("full_tunnel")
+      .then((v) => setFullTunnel(v === "1"))
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -130,7 +134,7 @@ export default function App() {
     setTunnelError(null);
     try {
       await setSetting("edge_url", edgeUrl);
-      const status = await connectTunnel(edgeUrl);
+      const status = await connectTunnel(edgeUrl, fullTunnel);
       setTunnel(status);
       setHandshake(status.handshake);
       // config_ready still counts as protected for the PQ session; transport may be pending
@@ -286,7 +290,9 @@ export default function App() {
                 <dd className={tunnel ? "" : "dim"}>
                   {tunnel
                     ? tunnel.transport === "wireguard"
-                      ? `WireGuard · ${tunnel.client_vpn_ip ?? "—"}`
+                      ? `WireGuard · ${tunnel.client_vpn_ip ?? "—"} · ${
+                          tunnel.routing === "full_tunnel" ? "all traffic" : "edge only"
+                        }`
                       : `Config ready · ${tunnel.state}`
                     : "— idle —"}
                 </dd>
@@ -420,6 +426,27 @@ export default function App() {
                 onChange={(e) => setEdgeUrl(e.target.value)}
                 onBlur={() => setSetting("edge_url", edgeUrl).catch(() => {})}
                 spellCheck={false}
+              />
+            </div>
+            <div className="setting">
+              <div>
+                <div className="s-name">Route all traffic through the tunnel</div>
+                <div className="s-desc">
+                  Full-tunnel mode sets AllowedIPs to 0.0.0.0/0 and ::/0 and pins DNS to the edge,
+                  so every packet leaves through the quantum-safe session — like a classic VPN.
+                  Off means only traffic to the edge itself is tunneled. Takes effect on the next
+                  connect.
+                </div>
+              </div>
+              <span className="spacer" />
+              <button
+                className={`toggle ${fullTunnel ? "on" : ""}`}
+                onClick={() => {
+                  const next = !fullTunnel;
+                  setFullTunnel(next);
+                  setSetting("full_tunnel", next ? "1" : "0").catch(() => {});
+                }}
+                aria-label="Route all traffic through the tunnel"
               />
             </div>
             <div className="setting">

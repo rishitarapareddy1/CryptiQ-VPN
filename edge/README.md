@@ -34,3 +34,38 @@ classical crypto alone. The WireGuard *data plane* still uses Curve25519
 |---|---|---|
 | `CRYPTIQ_EDGE_BIND` | `127.0.0.1:8787` | HTTP listen address |
 | `CRYPTIQ_WG_ENDPOINT` | `127.0.0.1:51820` | Advertised WireGuard endpoint |
+| `CRYPTIQ_EDGE_STATE_DIR` | `edge/` (crate dir) | Where the persistent server key + generated `wg-cryptiq.conf` live |
+| `CRYPTIQ_EDGE_DNS` | `1.1.1.1` | Resolver pushed to clients (full-tunnel clients pin DNS here) |
+| `CRYPTIQ_NAT_IFACE` | unset | Outbound interface (e.g. `eth0`). When set, the server config gets iptables MASQUERADE rules so full-tunnel clients reach the internet |
+
+The server WireGuard key is generated once and persisted to
+`$CRYPTIQ_EDGE_STATE_DIR/wg-server.key`, so restarts don't invalidate
+client configs.
+
+## Production deploy (Ubuntu VPS)
+
+One public box gives every download user something real to connect to.
+
+```bash
+# 1. install wireguard + enable forwarding
+sudo apt install -y wireguard-tools
+echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-cryptiq.conf && sudo sysctl --system
+
+# 2. run the edge (docker)
+docker build -f edge/Dockerfile -t cryptiq-edge .
+docker run -d --name cryptiq-edge --restart unless-stopped \
+  -p 8787:8787 -v /var/lib/cryptiq-edge:/state \
+  -e CRYPTIQ_WG_ENDPOINT="$(curl -s ifconfig.me):51820" \
+  -e CRYPTIQ_NAT_IFACE=eth0 \
+  cryptiq-edge
+
+# 3. bring up WireGuard on the host (re-run after new peers join,
+#    or use `wg syncconf` in a small cron/systemd timer)
+sudo wg-quick up /var/lib/cryptiq-edge/wg-cryptiq.conf
+
+# 4. open ports 8787/tcp (handshake) and 51820/udp (WireGuard) in your firewall
+```
+
+Then point the app's Settings → Edge URL at `http://YOUR_IP:8787` (put a
+TLS reverse proxy such as Caddy in front for production) and enable
+"Route all traffic through the tunnel" for full-VPN mode.

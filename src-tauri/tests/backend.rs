@@ -240,11 +240,26 @@ fn wg_conf_render_includes_dns_when_provided() {
         "10.66.66.2",
         "pub",
         "127.0.0.1:51820",
-        "10.66.66.1",
+        "10.66.66.1/32",
         Some("1.1.1.1"),
     );
     assert!(conf.contains("DNS = 1.1.1.1"));
     assert!(conf.contains("AllowedIPs = 10.66.66.1/32"));
+}
+
+#[test]
+fn wg_conf_full_tunnel_routes_everything() {
+    let conf = cryptiq_personal_lib::tunnel::render_wg_conf(
+        "priv",
+        "10.66.66.2",
+        "pub",
+        "edge.cryptiq.io:51820",
+        "0.0.0.0/0, ::/0",
+        Some("10.66.66.1"),
+    );
+    assert!(conf.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
+    // Full tunnel must pin DNS through the edge or lookups leak.
+    assert!(conf.contains("DNS = 10.66.66.1"));
 }
 
 // ---------- 6. live scan of the machine running the tests ----------

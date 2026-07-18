@@ -1,8 +1,9 @@
 fn main() {
+    let full_tunnel = std::env::args().any(|a| a == "--full-tunnel");
     let tm = cryptiq_personal_lib::tunnel::TunnelManager::new();
-    match tm.connect(Some("http://127.0.0.1:8787".into())) {
+    match tm.connect(Some("http://127.0.0.1:8787".into()), full_tunnel) {
         Ok(s) => {
-            println!("OK state={} transport={}", s.state, s.transport);
+            println!("OK state={} transport={} routing={}", s.state, s.transport, s.routing);
             println!(
                 "fingerprint={}",
                 s.handshake

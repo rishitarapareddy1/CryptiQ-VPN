@@ -32,6 +32,7 @@ pub struct TunnelStatus {
     pub endpoint: Option<String>,
     pub message: String,
     pub transport: String, // "wireguard" | "handshake_only"
+    pub routing: String,   // "peer_only" | "full_tunnel"
 }
 
 pub struct TunnelManager {
@@ -55,6 +56,7 @@ impl Default for TunnelStatus {
             endpoint: None,
             message: "Tunnel idle".into(),
             transport: "handshake_only".into(),
+            routing: "peer_only".into(),
         }
     }
 }
@@ -86,7 +88,7 @@ impl TunnelManager {
         Ok(g.status.clone())
     }
 
-    pub fn connect(&self, edge_url: Option<String>) -> Result<TunnelStatus, String> {
+    pub fn connect(&self, edge_url: Option<String>, full_tunnel: bool) -> Result<TunnelStatus, String> {
         let edge = edge_url
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_EDGE.to_string());
@@ -101,7 +103,7 @@ impl TunnelManager {
             g.status.message = format!("Negotiating hybrid handshake with {edge}");
         }
 
-        let result = self.connect_inner(&edge);
+        let result = self.connect_inner(&edge, full_tunnel);
         let mut g = self.inner.lock().unwrap();
         match result {
             Ok((status, active)) => {
@@ -124,6 +126,7 @@ impl TunnelManager {
     fn connect_inner(
         &self,
         edge: &str,
+        full_tunnel: bool,
     ) -> Result<(TunnelStatus, Option<PathBuf>), String> {
         let wg = generate_wg_keypair();
 
@@ -151,13 +154,26 @@ impl TunnelManager {
         }
 
         let conf_path = conf_dir()?.join("cryptiq0.conf");
+        let allowed_ips = if full_tunnel {
+            // Route everything through the edge. DNS pinned so lookups also
+            // traverse the tunnel (prevents DNS leaks).
+            "0.0.0.0/0, ::/0".to_string()
+        } else {
+            format!("{}/32", finish.server_vpn_ip)
+        };
+        // Full tunnel needs DNS pinned inside the tunnel; fall back to the
+        // edge's VPN IP if it didn't advertise a resolver.
+        let dns = finish
+            .dns
+            .clone()
+            .or_else(|| full_tunnel.then(|| finish.server_vpn_ip.clone()));
         let conf = render_wg_conf(
             &wg.private_b64,
             &finish.client_vpn_ip,
             &hello.server_wg_pub_b64,
             &hello.wg_endpoint,
-            &finish.server_vpn_ip,
-            finish.dns.as_deref(),
+            &allowed_ips,
+            dns.as_deref(),
         );
         std::fs::write(&conf_path, &conf).map_err(|e| e.to_string())?;
 
@@ -175,6 +191,7 @@ impl TunnelManager {
                 conf_path.display()
             ),
             transport: "handshake_only".into(),
+            routing: if full_tunnel { "full_tunnel" } else { "peer_only" }.into(),
         };
 
         // Try to bring the interface up. Failure is non-fatal — config is still valid.
@@ -235,7 +252,7 @@ pub fn render_wg_conf(
     client_ip: &str,
     server_pub_b64: &str,
     endpoint: &str,
-    server_vpn_ip: &str,
+    allowed_ips: &str,
     dns: Option<&str>,
 ) -> String {
     let dns_line = dns
@@ -251,7 +268,7 @@ pub fn render_wg_conf(
          [Peer]\n\
          PublicKey = {server_pub_b64}\n\
          Endpoint = {endpoint}\n\
-         AllowedIPs = {server_vpn_ip}/32\n\
+         AllowedIPs = {allowed_ips}\n\
          PersistentKeepalive = 25\n"
     )
 }
@@ -326,7 +343,7 @@ pub fn simulate_peer_exchange() -> Result<(HandshakeResult, String), String> {
         "10.66.66.2",
         &server_wg.public_b64,
         "127.0.0.1:51820",
-        "10.66.66.1",
+        "10.66.66.1/32",
         Some("1.1.1.1"),
     );
     assert!(conf.contains("PrivateKey ="));

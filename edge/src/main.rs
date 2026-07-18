@@ -29,7 +29,6 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-type Ek = <MlKem768 as KemCore>::EncapsulationKey;
 type Dk = <MlKem768 as KemCore>::DecapsulationKey;
 type Ct = Ciphertext<MlKem768>;
 
@@ -42,6 +41,11 @@ struct Inner {
     server_wg_private_b64: String,
     server_wg_public_b64: String,
     wg_endpoint: String,
+    dns: String,
+    state_dir: PathBuf,
+    /// Outbound interface for NAT (e.g. eth0). When set, the generated server
+    /// config masquerades client traffic so full-tunnel clients reach the internet.
+    nat_iface: Option<String>,
     /// Pending handshakes keyed by id.
     pending: HashMap<String, Pending>,
     /// Registered peers: wg public key → assigned VPN IP.
@@ -106,7 +110,7 @@ fn wg_keypair() -> (String, String) {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true, "service": "cryptiq-edge", "version": "0.4.0" }))
+    Json(serde_json::json!({ "ok": true, "service": "cryptiq-edge", "version": "0.5.0" }))
 }
 
 async fn handshake_start(State(state): State<AppState>) -> impl IntoResponse {
@@ -187,25 +191,42 @@ async fn handshake_finish(
         }
     };
 
+    let dns = state.inner.lock().dns.clone();
     Ok(Json(FinishRes {
         ok: true,
         session_fingerprint: fp,
         client_vpn_ip: client_ip,
         server_vpn_ip: "10.66.66.1".into(),
-        dns: Some("1.1.1.1".into()),
+        dns: Some(dns),
     }))
 }
 
 fn rewrite_server_conf(g: &Inner) -> Result<(), String> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = dir.join("wg-cryptiq.conf");
+    let path = g.state_dir.join("wg-cryptiq.conf");
+    // NAT rules let full-tunnel clients (AllowedIPs 0.0.0.0/0) reach the
+    // internet through this box. Linux-only; harmless to omit for local dev.
+    let nat = g
+        .nat_iface
+        .as_deref()
+        .map(|iface| {
+            format!(
+                "PostUp = iptables -A FORWARD -i %i -j ACCEPT; \
+                 iptables -A FORWARD -o %i -j ACCEPT; \
+                 iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE\n\
+                 PostDown = iptables -D FORWARD -i %i -j ACCEPT; \
+                 iptables -D FORWARD -o %i -j ACCEPT; \
+                 iptables -t nat -D POSTROUTING -o {iface} -j MASQUERADE\n"
+            )
+        })
+        .unwrap_or_default();
     let mut body = format!(
         "# CryptiQ edge WireGuard config — regenerated on each peer join\n\
          # Bring up with: sudo wg-quick up {}\n\
          [Interface]\n\
          PrivateKey = {}\n\
          Address = 10.66.66.1/24\n\
-         ListenPort = 51820\n\n",
+         ListenPort = 51820\n\
+         {nat}\n",
         path.display(),
         g.server_wg_private_b64
     );
@@ -219,17 +240,52 @@ fn rewrite_server_conf(g: &Inner) -> Result<(), String> {
     Ok(())
 }
 
+/// Load the WireGuard keypair from disk, or generate and persist one.
+/// A stable key is required in production: clients cache the server public
+/// key in their configs, and a restart must not invalidate them.
+fn load_or_create_wg_keypair(state_dir: &PathBuf) -> (String, String) {
+    let key_path = state_dir.join("wg-server.key");
+    if let Ok(existing) = std::fs::read_to_string(&key_path) {
+        let priv_b64 = existing.trim().to_string();
+        if let Ok(bytes) = B64.decode(&priv_b64) {
+            if bytes.len() == 32 {
+                let mut sk = [0u8; 32];
+                sk.copy_from_slice(&bytes);
+                let secret = StaticSecret::from(sk);
+                let public = PublicKey::from(&secret);
+                return (priv_b64, B64.encode(public.as_bytes()));
+            }
+        }
+        eprintln!("warning: {} is corrupt, generating a new key", key_path.display());
+    }
+    let (priv_b64, pub_b64) = wg_keypair();
+    if let Err(e) = std::fs::write(&key_path, &priv_b64) {
+        eprintln!("warning: could not persist server key: {e}");
+    }
+    (priv_b64, pub_b64)
+}
+
 #[tokio::main]
 async fn main() {
-    let (priv_b64, pub_b64) = wg_keypair();
+    let state_dir = std::env::var("CRYPTIQ_EDGE_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+    let (priv_b64, pub_b64) = load_or_create_wg_keypair(&state_dir);
     let endpoint = std::env::var("CRYPTIQ_WG_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:51820".into());
     let bind = std::env::var("CRYPTIQ_EDGE_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let dns = std::env::var("CRYPTIQ_EDGE_DNS").unwrap_or_else(|_| "1.1.1.1".into());
+    let nat_iface = std::env::var("CRYPTIQ_NAT_IFACE").ok().filter(|s| !s.is_empty());
 
     let state = AppState {
         inner: Arc::new(Mutex::new(Inner {
             server_wg_private_b64: priv_b64,
             server_wg_public_b64: pub_b64.clone(),
             wg_endpoint: endpoint.clone(),
+            dns,
+            state_dir,
+            nat_iface,
             pending: HashMap::new(),
             peers: HashMap::new(),
             next_host: 1, // .2 onwards for clients
@@ -247,13 +303,14 @@ async fn main() {
         .route("/v1/handshake/start", get(handshake_start))
         .route("/v1/handshake/finish", post(handshake_finish))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr: SocketAddr = bind.parse().expect("bad CRYPTIQ_EDGE_BIND");
+    let conf_hint = state.inner.lock().state_dir.join("wg-cryptiq.conf");
     println!("cryptiq-edge listening on http://{addr}");
     println!("WireGuard public key: {pub_b64}");
     println!("WireGuard endpoint:   {endpoint}");
-    println!("Bring up WG with:     sudo wg-quick up edge/wg-cryptiq.conf");
+    println!("Bring up WG with:     sudo wg-quick up {}", conf_hint.display());
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
