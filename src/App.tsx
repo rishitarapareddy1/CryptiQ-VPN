@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   applyRemediation,
-  establishTunnel,
+  connectTunnel,
+  disconnectTunnel,
   Finding,
   getAppliedFindings,
   getRemediationLog,
@@ -11,6 +12,7 @@ import {
   rollbackRemediation,
   runScan,
   setSetting,
+  TunnelStatus,
 } from "./api";
 import Lattice from "./Lattice";
 import Technical from "./Technical";
@@ -42,7 +44,7 @@ const STATE_COPY: Record<ShieldState, { word: string; sub: string }> = {
   },
   protected: {
     word: "Protected",
-    sub: "Hybrid post-quantum session established. Your key exchange is safe against both classical and quantum adversaries.",
+    sub: "Hybrid post-quantum session established with the CryptiQ edge. Your control-plane key exchange is ML-KEM-768 + X25519; WireGuard carries the data plane.",
   },
 };
 
@@ -50,6 +52,9 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("shield");
   const [shield, setShield] = useState<ShieldState>("exposed");
   const [handshake, setHandshake] = useState<HandshakeResult | null>(null);
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
+  const [edgeUrl, setEdgeUrl] = useState("http://64.181.224.148:8787");
+  const [tunnelError, setTunnelError] = useState<string | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [scanning, setScanning] = useState(false);
   const [queue, setQueue] = useState<Set<string>>(new Set());
@@ -58,6 +63,7 @@ export default function App() {
   const [log, setLog] = useState<RemediationEntry[]>([]);
   const [localOnly, setLocalOnly] = useState(true);
   const [autoQueue, setAutoQueue] = useState(false);
+  const [fullTunnel, setFullTunnel] = useState(false);
   const [onboardStep, setOnboardStep] = useState<number | null>(null);
 
   const scan = useCallback(async () => {
@@ -93,6 +99,14 @@ export default function App() {
         if (v !== "1") setOnboardStep(0);
       })
       .catch(() => {});
+    getSetting("edge_url")
+      .then((v) => {
+        if (v) setEdgeUrl(v);
+      })
+      .catch(() => {});
+    getSetting("full_tunnel")
+      .then((v) => setFullTunnel(v === "1"))
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -102,22 +116,32 @@ export default function App() {
   };
 
   const connect = async () => {
-    if (shield === "protected") {
-      setShield("exposed");
-      setHandshake(null);
+    if (shield === "protected" || shield === "negotiating") {
+      if (shield === "protected") {
+        try {
+          await disconnectTunnel();
+        } catch {
+          /* ignore */
+        }
+        setShield("exposed");
+        setHandshake(null);
+        setTunnel(null);
+        setTunnelError(null);
+      }
       return;
     }
     setShield("negotiating");
+    setTunnelError(null);
     try {
-      // let the negotiating state breathe for a beat — the real handshake is sub-ms
-      const [result] = await Promise.all([
-        establishTunnel(),
-        new Promise((r) => setTimeout(r, 1400)),
-      ]);
-      setHandshake(result);
+      await setSetting("edge_url", edgeUrl);
+      const status = await connectTunnel(edgeUrl, fullTunnel);
+      setTunnel(status);
+      setHandshake(status.handshake);
+      // config_ready still counts as protected for the PQ session; transport may be pending
       setShield("protected");
-    } catch {
+    } catch (e) {
       setShield("exposed");
+      setTunnelError(typeof e === "string" ? e : "Could not reach the CryptiQ edge");
     }
   };
 
@@ -235,6 +259,10 @@ export default function App() {
               <div className="state-label">Quantum shield · {shield}</div>
               <h1 className="state-word">{STATE_COPY[shield].word}</h1>
               <p className="state-sub">{STATE_COPY[shield].sub}</p>
+              {tunnelError && <p className="tunnel-error">{tunnelError}</p>}
+              {tunnel?.message && shield === "protected" && (
+                <p className="tunnel-msg">{tunnel.message}</p>
+              )}
               <div className="hero-actions">
                 <button
                   className="btn-primary"
@@ -244,8 +272,8 @@ export default function App() {
                   {shield === "protected"
                     ? "Disconnect"
                     : shield === "negotiating"
-                      ? "Negotiating…"
-                      : "Establish quantum-safe session"}
+                      ? "Negotiating with edge…"
+                      : "Connect quantum-safe tunnel"}
                 </button>
                 <button className="btn-ghost" onClick={() => setTab("assets")}>
                   {counts.critical + counts.warn} assets need attention
@@ -258,8 +286,16 @@ export default function App() {
                 <dd className={handshake ? "" : "dim"}>{handshake?.kem ?? "— idle —"}</dd>
               </div>
               <div>
-                <dt>Classical layer</dt>
-                <dd className={handshake ? "" : "dim"}>{handshake?.classical ?? "— idle —"}</dd>
+                <dt>Transport</dt>
+                <dd className={tunnel ? "" : "dim"}>
+                  {tunnel
+                    ? tunnel.transport === "wireguard"
+                      ? `WireGuard · ${tunnel.client_vpn_ip ?? "—"} · ${
+                          tunnel.routing === "full_tunnel" ? "all traffic" : "edge only"
+                        }`
+                      : `Config ready · ${tunnel.state}`
+                    : "— idle —"}
+                </dd>
               </div>
               <div>
                 <dt>Session fingerprint</dt>
@@ -268,11 +304,9 @@ export default function App() {
                 </dd>
               </div>
               <div>
-                <dt>Handshake</dt>
-                <dd className={handshake ? "" : "dim"}>
-                  {handshake
-                    ? `${handshake.duration_ms.toFixed(2)} ms · ${handshake.kem_ciphertext_bytes} B ct`
-                    : "— no session —"}
+                <dt>Edge</dt>
+                <dd className={tunnel ? "" : "dim"}>
+                  {tunnel?.endpoint ?? tunnel?.edge_url ?? "— no edge —"}
                 </dd>
               </div>
             </dl>
@@ -376,6 +410,46 @@ export default function App() {
           <div className="assets">
             <div className="assets-head">
               <h2>Settings</h2>
+            </div>
+            <div className="setting">
+              <div>
+                <div className="s-name">Edge URL</div>
+                <div className="s-desc">
+                  CryptiQ edge that speaks the hybrid handshake. Default is the public CryptiQ
+                  edge; for local development run{" "}
+                  <span className="mono-inline">cargo run --manifest-path edge/Cargo.toml</span>{" "}
+                  and set this to <span className="mono-inline">http://127.0.0.1:8787</span>
+                </div>
+              </div>
+              <span className="spacer" />
+              <input
+                className="edge-input"
+                value={edgeUrl}
+                onChange={(e) => setEdgeUrl(e.target.value)}
+                onBlur={() => setSetting("edge_url", edgeUrl).catch(() => {})}
+                spellCheck={false}
+              />
+            </div>
+            <div className="setting">
+              <div>
+                <div className="s-name">Route all traffic through the tunnel</div>
+                <div className="s-desc">
+                  Full-tunnel mode sets AllowedIPs to 0.0.0.0/0 and ::/0 and pins DNS to the edge,
+                  so every packet leaves through the quantum-safe session — like a classic VPN.
+                  Off means only traffic to the edge itself is tunneled. Takes effect on the next
+                  connect.
+                </div>
+              </div>
+              <span className="spacer" />
+              <button
+                className={`toggle ${fullTunnel ? "on" : ""}`}
+                onClick={() => {
+                  const next = !fullTunnel;
+                  setFullTunnel(next);
+                  setSetting("full_tunnel", next ? "1" : "0").catch(() => {});
+                }}
+                aria-label="Route all traffic through the tunnel"
+              />
             </div>
             <div className="setting">
               <div>
