@@ -225,12 +225,13 @@ fn migration_detail_returns_before_and_after_content() {
 
     let file = dir.path().join("ssh_config");
     std::fs::write(&file, "Host old\n\n# managed block\nIdentityFile new\n").unwrap();
-    store.save_snapshot("ssh:x.pub", &file.to_string_lossy(), Some("Host old\n"));
-    store.log_remediation("ssh:x.pub", "config_edit", "added managed block");
+    // SSH key findings share the canonical ssh:config snapshot.
+    store.save_snapshot("ssh:config", &file.to_string_lossy(), Some("Host old\n"));
+    store.log_remediation("ssh:x.pub", "ssh_migration", "added managed block");
 
     let d = cryptiq_personal_lib::migrate::migration_detail(&store, "ssh:x.pub").unwrap();
     assert_eq!(d.finding_id, "ssh:x.pub");
-    assert_eq!(d.action, "config_edit");
+    assert_eq!(d.action, "ssh_migration");
     assert_eq!(d.before.as_deref(), Some("Host old\n"));
     assert_eq!(
         d.after.as_deref(),
