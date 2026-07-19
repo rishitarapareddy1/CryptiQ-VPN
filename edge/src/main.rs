@@ -325,13 +325,16 @@ fn rewrite_server_conf(g: &Inner) -> Result<(), String> {
     let path = g.state_dir.join("wg-cryptiq.conf");
     // NAT rules let full-tunnel clients (AllowedIPs 0.0.0.0/0) reach the
     // internet through this box. Linux-only; harmless to omit for local dev.
+    // Insert (-I ... 1) rather than append: cloud images (Oracle, etc.) often
+    // ship a catch-all REJECT at the end of FORWARD, and an appended ACCEPT
+    // would never be reached since iptables stops at the first match.
     let nat = g
         .nat_iface
         .as_deref()
         .map(|iface| {
             format!(
-                "PostUp = iptables -A FORWARD -i %i -j ACCEPT; \
-                 iptables -A FORWARD -o %i -j ACCEPT; \
+                "PostUp = iptables -I FORWARD 1 -i %i -j ACCEPT; \
+                 iptables -I FORWARD 1 -o %i -j ACCEPT; \
                  iptables -t nat -A POSTROUTING -o {iface} -j MASQUERADE\n\
                  PostDown = iptables -D FORWARD -i %i -j ACCEPT; \
                  iptables -D FORWARD -o %i -j ACCEPT; \
