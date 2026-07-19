@@ -1,6 +1,6 @@
 [package]
 name = "cryptiq-edge"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2021"
 description = "Local CryptiQ edge peer — hybrid PQ handshake + WireGuard peer registry"
 

@@ -23,10 +23,15 @@ sudo wg-quick up ./edge/wg-cryptiq.conf
 3. `POST /v1/handshake/finish` with ciphertext + client X25519 public + client WireGuard public
 4. Edge verifies, assigns `10.66.66.N`, returns fingerprint + VPN IPs
 
-The PQ handshake is what makes the *control plane* quantum-safe: an eavesdropper
-who records steps 1–3 cannot later recover the WireGuard peer keys by breaking
-classical crypto alone. The WireGuard *data plane* still uses Curve25519
-(standard today); migrating that to a PQ AEAD is a later protocol change.
+The hybrid session key does two jobs. It authenticates steps 1–3 (so an
+eavesdropper who records the handshake can't later recover the WireGuard peer
+keys by breaking classical crypto alone), and it's fed into `derive_wg_psk`
+to become the WireGuard PresharedKey both sides install. Because WireGuard
+folds the PSK into every key it derives, the *data plane* — not just the
+handshake — now also requires breaking ML-KEM-768 in addition to Curve25519.
+WireGuard's own cipher (ChaCha20-Poly1305) is still classical, so this is
+hybrid PQ hardening, not a full PQ AEAD replacement — but recorded traffic
+can't be decrypted later by breaking Curve25519 alone.
 
 ## Env
 
