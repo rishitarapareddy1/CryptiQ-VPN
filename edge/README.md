@@ -50,23 +50,30 @@ client configs.
 ## Production deploy (Ubuntu VPS)
 
 One public box gives every download user something real to connect to.
+The `Dockerfile` here is a valid way to build/ship the binary, but the
+production box (`64.181.224.148`) actually runs it as a bare binary under
+systemd — no Docker daemon on that host. `edge/deploy/` has the exact unit
+files in use; this is the path that's actually verified working end-to-end
+(real handshake, real full-tunnel traffic, sustained megabytes transferred).
 
 ```bash
 # 1. install wireguard + enable forwarding
-sudo apt install -y wireguard-tools
+sudo apt install -y wireguard-tools iptables-persistent
 echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-cryptiq.conf && sudo sysctl --system
 
-# 2. run the edge (docker)
-docker build -f edge/Dockerfile -t cryptiq-edge .
-docker run -d --name cryptiq-edge --restart unless-stopped \
-  -p 8787:8787 -v /var/lib/cryptiq-edge:/state \
-  -e CRYPTIQ_WG_ENDPOINT="$(curl -s ifconfig.me):51820" \
-  -e CRYPTIQ_NAT_IFACE=eth0 \
-  cryptiq-edge
+# 2. build the binary on the box (no cross-compile toolchain assumed)
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+# copy edge/ to the box (scp or git clone), then:
+cd cryptiq-edge-src && cargo build --release
 
-# 3. bring up WireGuard on the host (re-run after new peers join,
-#    or use `wg syncconf` in a small cron/systemd timer)
-sudo wg-quick up /var/lib/cryptiq-edge/wg-cryptiq.conf
+# 3. install the systemd units (adjust User=/paths/CRYPTIQ_WG_ENDPOINT/
+#    CRYPTIQ_NAT_IFACE in cryptiq-edge.service to match your box first)
+sudo cp edge/deploy/cryptiq-edge.service edge/deploy/cryptiq-wg-sync.service \
+        edge/deploy/cryptiq-wg-sync.timer /etc/systemd/system/
+sudo cp edge/deploy/cryptiq-wg-sync /usr/local/bin/cryptiq-wg-sync
+sudo chmod +x /usr/local/bin/cryptiq-wg-sync
+sudo systemctl daemon-reload
+sudo systemctl enable --now cryptiq-edge.service cryptiq-wg-sync.timer
 
 # 4. open ports 8787/tcp (handshake) and 51820/udp (WireGuard) in your firewall
 ```
@@ -74,3 +81,39 @@ sudo wg-quick up /var/lib/cryptiq-edge/wg-cryptiq.conf
 Then point the app's Settings → Edge URL at `http://YOUR_IP:8787` (put a
 TLS reverse proxy such as Caddy in front for production) and enable
 "Route all traffic through the tunnel" for full-VPN mode.
+
+### Two gotchas that cost real debugging time — check both on any new box
+
+1. **`FORWARD` chain ordering.** Cloud images (confirmed on this exact
+   Oracle box) often ship a catch-all `REJECT --reject-with
+   icmp-host-prohibited` at the *end* of the `FORWARD` chain already.
+   `rewrite_server_conf` in `edge/src/main.rs` writes its `PostUp` rules
+   with `iptables -I FORWARD 1 ...` (insert at the top) specifically so
+   they land ahead of that reject — an `-A` append would silently never
+   fire. Verify with `sudo iptables -L FORWARD -n -v --line-numbers`: our
+   two `ACCEPT` rules for the `wg-cryptiq` interface must come *before*
+   any unconditional `REJECT`/`DROP`.
+
+2. **`cryptiq-wg-sync` needs real root, not just a NOPASSWD user.**
+   `cryptiq-edge.service` runs as an unprivileged user (`User=ubuntu`), and
+   it calls `/usr/local/bin/cryptiq-wg-sync` directly — with no `sudo`
+   wrapper — every time a peer registers, plus every 30s via
+   `cryptiq-wg-sync.timer`. The script in `edge/deploy/cryptiq-wg-sync`
+   therefore prefixes every privileged step with its own `sudo`, and uses
+   a temp file instead of `<(process substitution)` — `sudo` closes
+   inherited file descriptors by default, which breaks that pipe with a
+   cryptic `fopen: No such file or directory`. Skip either fix and the
+   *symptom* is brutal to trace back to this: `wg syncconf` replaces the
+   entire peer table with whatever it reads, so a permission failure here
+   doesn't just fail loudly — it silently re-syncs to a **stale** list
+   every 30 seconds, evicting whichever peer just connected. That reads
+   as "the tunnel works for ~10–30 seconds then the internet dies," which
+   looks nothing like a permissions bug.
+
+   This also requires the unprivileged user actually having root
+   available via `sudo` — on Ubuntu cloud images that's typically a
+   blanket `ubuntu ALL=(ALL) NOPASSWD:ALL` from cloud-init. That's broader
+   than this script needs (it only ever runs `cp`, `wg-quick`, `wg`); if
+   you're hardening this deployment, scope it to a dedicated
+   `/etc/sudoers.d/cryptiq` rule restricted to those three commands
+   instead of leaving the default wide open.

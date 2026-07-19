@@ -1,0 +1,16 @@
+[Unit]
+Description=CryptiQ edge
+After=network.target
+
+[Service]
+User=ubuntu
+Environment=CRYPTIQ_EDGE_BIND=0.0.0.0:8787
+Environment=CRYPTIQ_EDGE_STATE_DIR=/home/ubuntu/cryptiq-state
+Environment=CRYPTIQ_WG_ENDPOINT=64.181.224.148:51820
+Environment=CRYPTIQ_NAT_IFACE=ens3
+ExecStart=/home/ubuntu/cryptiq-edge-src/target/release/cryptiq-edge
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

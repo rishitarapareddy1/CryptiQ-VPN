@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync CryptiQ WireGuard peers
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cryptiq-wg-sync

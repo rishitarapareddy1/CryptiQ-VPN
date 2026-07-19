@@ -1,0 +1,23 @@
+#!/bin/bash
+# Live-reload the wg-cryptiq interface's peer table from the state the edge
+# process just wrote, without a full down/up cycle. Invoked both by the
+# cryptiq-edge process itself (after every new peer registers) and by the
+# cryptiq-wg-sync.timer as a 30s backstop.
+#
+# Runs as the unprivileged `ubuntu` user (cryptiq-edge.service has no
+# User=root), so every privileged step needs its own `sudo`. Uses a temp
+# file rather than `<(process substitution)`: sudo closes inherited file
+# descriptors by default, which silently breaks that pipe ("fopen: No such
+# file or directory") the moment any step here runs under sudo.
+set -e
+CONF=/home/ubuntu/cryptiq-state/wg-cryptiq.conf
+[ -f "$CONF" ] || exit 0
+sudo cp "$CONF" /etc/wireguard/wg-cryptiq.conf
+if ! ip link show wg-cryptiq &>/dev/null; then
+  sudo wg-quick up wg-cryptiq
+else
+  STRIPPED=$(mktemp)
+  sudo wg-quick strip wg-cryptiq > "$STRIPPED"
+  sudo wg syncconf wg-cryptiq "$STRIPPED"
+  rm -f "$STRIPPED"
+fi
