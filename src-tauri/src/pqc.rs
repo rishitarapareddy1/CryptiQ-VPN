@@ -4,10 +4,12 @@
 //! - `hybrid_handshake()` — both sides in-process (tests / offline demo)
 //! - `client_finish` / `ServerSession` — networked handshake with a CryptiQ edge node
 //!
-//! The derived session key authenticates the WireGuard peer exchange; WireGuard
-//! itself still uses Curve25519 for the data plane (industry standard today).
-//! The PQ layer means an eavesdropper who records the handshake cannot later
-//! recover the WireGuard keys by breaking classical crypto alone.
+//! The derived session key does two jobs: it authenticates the WireGuard peer
+//! exchange, and (via `derive_wg_psk`) it becomes the WireGuard PresharedKey
+//! that both sides mix into the data-plane key schedule. Because WireGuard
+//! folds the PSK into every session key it derives, breaking the tunnel
+//! requires breaking ML-KEM-768 in addition to Curve25519 — the data plane
+//! inherits the post-quantum security of the handshake.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ml_kem::kem::{Decapsulate, Encapsulate};
@@ -64,6 +66,29 @@ fn hybrid_kdf(ss_pq: &[u8], ss_x25519: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     key.copy_from_slice(&out);
     key
+}
+
+/// Derive the WireGuard PresharedKey from the hybrid session key.
+///
+/// WireGuard mixes the PSK into its own key schedule, so with this in place
+/// an attacker must break ML-KEM-768 *in addition to* Curve25519 to decrypt
+/// the data plane — the tunnel itself becomes quantum-resistant, not just
+/// the peer exchange. Domain-separated from the session key by the label.
+pub fn derive_wg_psk(session_key: &[u8; 32]) -> String {
+    let mut kdf = Sha256::new();
+    kdf.update(b"cryptiq-wg-psk-v1");
+    kdf.update(session_key);
+    B64.encode(kdf.finalize())
+}
+
+/// Short hex fingerprint of a derived PSK (for display, never the key itself).
+pub fn psk_fingerprint(psk_b64: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(psk_b64.as_bytes());
+    h.finalize()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn encode_fixed(bytes: &[u8]) -> Result<Encoded<Ek>, String> {

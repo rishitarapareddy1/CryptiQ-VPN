@@ -21,6 +21,12 @@
   --accent-glow: rgba(157, 123, 255, 0.22);
 }
 
+[data-state="config_ready"] {
+  --accent: #e6b84d;
+  --accent-soft: rgba(230, 184, 77, 0.1);
+  --accent-glow: rgba(230, 184, 77, 0.22);
+}
+
 [data-state="protected"] {
   --accent: #2fd4b6;
   --accent-soft: rgba(47, 212, 182, 0.09);

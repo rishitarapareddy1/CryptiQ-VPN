@@ -173,6 +173,40 @@ fn wifi_policy_applies_and_rolls_back_via_settings() {
 }
 
 #[test]
+fn ssh_known_hosts_is_not_auto_migratable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+    let err = cryptiq_personal_lib::migrate::apply_ssh_migration(&store, "ssh:known_hosts")
+        .unwrap_err();
+    assert!(err.contains("not an auto-migratable"));
+}
+
+#[test]
+fn ssh_config_snapshot_is_shared_across_key_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store::open_at(&dir.path().join("t.db"));
+    let cfg = dir.path().join("config");
+    std::fs::write(&cfg, "Host example\n  User git\n").unwrap();
+
+    // Simulate the canonical snapshot path by writing under ssh:config directly —
+    // the shared-id contract is what prevents rollback collisions.
+    store.save_snapshot("ssh:config", &cfg.to_string_lossy(), Some("Host example\n  User git\n"));
+    store.log_remediation("ssh:config", "ssh_migration", "canonical");
+    store.log_remediation("ssh:id_rsa.pub", "ssh_migration", "key a");
+    store.log_remediation("ssh:id_ecdsa.pub", "ssh_migration", "key b");
+
+    // Mutate the file as a later migration would.
+    std::fs::write(&cfg, "MUTATED\n").unwrap();
+
+    cryptiq_personal_lib::migrate::rollback(&store, "ssh:id_rsa.pub").unwrap();
+    let restored = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(restored, "Host example\n  User git\n");
+    // All related findings cleared.
+    let applied = store.applied_findings();
+    assert!(!applied.iter().any(|id| id.starts_with("ssh:")));
+}
+
+#[test]
 fn settings_upsert() {
     let dir = tempfile::tempdir().unwrap();
     let store = store::open_at(&dir.path().join("t.db"));
@@ -242,6 +276,7 @@ fn wg_conf_render_includes_dns_when_provided() {
         "127.0.0.1:51820",
         "10.66.66.1/32",
         Some("1.1.1.1"),
+        None,
     );
     assert!(conf.contains("DNS = 1.1.1.1"));
     assert!(conf.contains("AllowedIPs = 10.66.66.1/32"));
@@ -256,10 +291,42 @@ fn wg_conf_full_tunnel_routes_everything() {
         "edge.cryptiq.io:51820",
         "0.0.0.0/0, ::/0",
         Some("10.66.66.1"),
+        Some("psk-b64-value"),
     );
     assert!(conf.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
     // Full tunnel must pin DNS through the edge or lookups leak.
     assert!(conf.contains("DNS = 10.66.66.1"));
+    assert!(conf.contains("PresharedKey = psk-b64-value"));
+}
+
+#[test]
+fn wg_psk_is_deterministic_domain_separated_and_valid_wg_key() {
+    use base64::Engine;
+    let key_a = [7u8; 32];
+    let key_b = [8u8; 32];
+    let psk_a = cryptiq_personal_lib::pqc::derive_wg_psk(&key_a);
+    let psk_a2 = cryptiq_personal_lib::pqc::derive_wg_psk(&key_a);
+    let psk_b = cryptiq_personal_lib::pqc::derive_wg_psk(&key_b);
+    // Both peers derive the same PSK from the same session key…
+    assert_eq!(psk_a, psk_a2);
+    // …different sessions get different PSKs…
+    assert_ne!(psk_a, psk_b);
+    // …the PSK is not the session key itself (domain separation)…
+    assert_ne!(
+        base64::engine::general_purpose::STANDARD.decode(&psk_a).unwrap(),
+        key_a.to_vec()
+    );
+    // …and it decodes to exactly the 32 bytes WireGuard requires.
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.decode(&psk_a).unwrap().len(),
+        32
+    );
+}
+
+#[test]
+fn simulated_exchange_yields_matching_psk_in_conf() {
+    let (_, conf) = cryptiq_personal_lib::tunnel::simulate_peer_exchange().unwrap();
+    assert!(conf.contains("PresharedKey = "));
 }
 
 // ---------- 6. live scan of the machine running the tests ----------

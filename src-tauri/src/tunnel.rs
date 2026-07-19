@@ -33,6 +33,9 @@ pub struct TunnelStatus {
     pub message: String,
     pub transport: String, // "wireguard" | "handshake_only"
     pub routing: String,   // "peer_only" | "full_tunnel"
+    /// Fingerprint of the ML-KEM-derived WireGuard PresharedKey (proof the
+    /// data plane is PQ-hardened; never the key itself).
+    pub psk_fingerprint: Option<String>,
 }
 
 pub struct TunnelManager {
@@ -57,6 +60,7 @@ impl Default for TunnelStatus {
             message: "Tunnel idle".into(),
             transport: "handshake_only".into(),
             routing: "peer_only".into(),
+            psk_fingerprint: None,
         }
     }
 }
@@ -77,15 +81,61 @@ impl TunnelManager {
 
     pub fn disconnect(&self) -> Result<TunnelStatus, String> {
         let mut g = self.inner.lock().unwrap();
-        if let Some(conf) = g.active_conf.take() {
+        // Prefer the conf we brought up; fall back to the written path so
+        // config_ready sessions can still tear down if the user brought WG up manually.
+        let conf = g.active_conf.take().or_else(|| {
+            g.status
+                .config_path
+                .as_ref()
+                .map(PathBuf::from)
+        });
+        if let Some(conf) = conf {
             let _ = run_wg_quick("down", &conf);
-            let _ = std::fs::remove_file(&conf);
+            let iface_conf = conf
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("{IFACE}.conf"));
+            let _ = std::fs::remove_file(&iface_conf);
         }
         g.status = TunnelStatus {
             edge_url: g.status.edge_url.clone(),
             ..TunnelStatus::default()
         };
         Ok(g.status.clone())
+    }
+
+    /// Retry `wg-quick up` on an existing config_ready session (shows the
+    /// macOS admin password dialog). No-op if already up.
+    pub fn bring_up(&self) -> Result<TunnelStatus, String> {
+        let conf_path = {
+            let g = self.inner.lock().unwrap();
+            if g.status.state == "up" {
+                return Ok(g.status.clone());
+            }
+            g.status
+                .config_path
+                .clone()
+                .ok_or_else(|| "no WireGuard config ready — connect first".to_string())?
+        };
+        let path = PathBuf::from(&conf_path);
+        match run_wg_quick("up", &path) {
+            Ok(()) => {
+                let mut g = self.inner.lock().unwrap();
+                g.active_conf = Some(path);
+                g.status.state = "up".into();
+                g.status.transport = "wireguard".into();
+                g.status.message = format!(
+                    "Tunnel up — traffic via ML-KEM-768 PSK + WireGuard ({})",
+                    g.status
+                        .handshake
+                        .as_ref()
+                        .map(|h| h.session_fingerprint.clone())
+                        .unwrap_or_default()
+                );
+                Ok(g.status.clone())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn connect(&self, edge_url: Option<String>, full_tunnel: bool) -> Result<TunnelStatus, String> {
@@ -167,6 +217,9 @@ impl TunnelManager {
             .dns
             .clone()
             .or_else(|| full_tunnel.then(|| finish.server_vpn_ip.clone()));
+        // Mix the ML-KEM-derived key into WireGuard's key schedule: with the
+        // PSK set on both sides, the data plane is quantum-resistant too.
+        let psk = pqc::derive_wg_psk(&secrets.session_key);
         let conf = render_wg_conf(
             &wg.private_b64,
             &finish.client_vpn_ip,
@@ -174,8 +227,15 @@ impl TunnelManager {
             &hello.wg_endpoint,
             &allowed_ips,
             dns.as_deref(),
+            Some(&psk),
         );
         std::fs::write(&conf_path, &conf).map_err(|e| e.to_string())?;
+        // Config holds the WG private key + PSK; owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&conf_path, std::fs::Permissions::from_mode(0o600));
+        }
 
         let handshake = pqc::to_handshake_result(&secrets);
         let mut status = TunnelStatus {
@@ -192,6 +252,7 @@ impl TunnelManager {
             ),
             transport: "handshake_only".into(),
             routing: if full_tunnel { "full_tunnel" } else { "peer_only" }.into(),
+            psk_fingerprint: Some(pqc::psk_fingerprint(&psk)),
         };
 
         // Try to bring the interface up. Failure is non-fatal — config is still valid.
@@ -254,12 +315,18 @@ pub fn render_wg_conf(
     endpoint: &str,
     allowed_ips: &str,
     dns: Option<&str>,
+    preshared_key_b64: Option<&str>,
 ) -> String {
     let dns_line = dns
         .map(|d| format!("DNS = {d}\n"))
         .unwrap_or_default();
+    let psk_line = preshared_key_b64
+        .map(|k| format!("PresharedKey = {k}\n"))
+        .unwrap_or_default();
     format!(
         "# CryptiQ Personal — generated after ML-KEM-768 + X25519 handshake\n\
+         # The PresharedKey below is derived from the ML-KEM-768 shared secret,\n\
+         # making the WireGuard data plane quantum-resistant as well.\n\
          # Do not share this file; it contains your WireGuard private key.\n\
          [Interface]\n\
          PrivateKey = {private_b64}\n\
@@ -267,6 +334,7 @@ pub fn render_wg_conf(
          {dns_line}\
          [Peer]\n\
          PublicKey = {server_pub_b64}\n\
+         {psk_line}\
          Endpoint = {endpoint}\n\
          AllowedIPs = {allowed_ips}\n\
          PersistentKeepalive = 25\n"
@@ -274,21 +342,17 @@ pub fn render_wg_conf(
 }
 
 fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
-    // Prefer Homebrew path; fall back to PATH.
-    let wg_quick = [
-        "/opt/homebrew/bin/wg-quick",
-        "/usr/local/bin/wg-quick",
-        "wg-quick",
-    ]
-    .into_iter()
-    .find(|p| Path::new(p).exists() || *p == "wg-quick")
-    .unwrap_or("wg-quick");
+    // wg-quick must exist; without wireguard-tools there is nothing to escalate to.
+    let wg_quick = ["/opt/homebrew/bin/wg-quick", "/usr/local/bin/wg-quick"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .ok_or("WireGuard tools not installed. Install with: brew install wireguard-tools")?;
 
     // macOS ships bash 3 at /bin/bash; Homebrew wg-quick needs bash 4+.
-    let bash = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "bash"]
+    let bash = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
         .into_iter()
-        .find(|p| *p == "bash" || Path::new(p).exists())
-        .unwrap_or("bash");
+        .find(|p| Path::new(p).exists())
+        .unwrap_or("/bin/bash");
 
     // Copy to a name wg-quick accepts as an interface name (no path weirdness).
     // On macOS, wg-quick expects the interface name from the filename stem.
@@ -300,26 +364,44 @@ fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
         std::fs::copy(conf, &iface_conf).map_err(|e| e.to_string())?;
     }
 
-    let out = Command::new(bash)
+    // First try without escalation (works when already root, e.g. CLI/tests
+    // run under sudo). wg-quick needs root, so from the GUI this will fail.
+    let direct = Command::new(bash)
         .arg(wg_quick)
         .arg(action)
         .arg(&iface_conf)
+        .output();
+    if let Ok(o) = &direct {
+        if o.status.success() {
+            return Ok(());
+        }
+    }
+
+    // Escalate through the native macOS admin-password dialog. This is the
+    // path a GUI app is supposed to use — no terminal, no silent sudo failure.
+    let shell_cmd = format!(
+        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin '{bash}' '{wg_quick}' {action} '{}'",
+        iface_conf.display()
+    );
+    let verb = if action == "up" { "start" } else { "stop" };
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges with prompt \"CryptiQ Personal wants to {verb} the quantum-safe tunnel.\"",
+        shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let out = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
         .output()
-        .map_err(|e| {
-            format!(
-                "could not run wg-quick ({e}). Install with: brew install wireguard-tools"
-            )
-        })?;
+        .map_err(|e| format!("could not run osascript: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "{} {}",
-            String::from_utf8_lossy(&out.stderr).trim(),
-            String::from_utf8_lossy(&out.stdout).trim()
-        )
-        .trim()
-        .to_string())
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.contains("User canceled") || err.contains("-128") {
+            Err("Administrator authorization was declined — tunnel config is ready but the interface was not brought up.".into())
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -338,6 +420,11 @@ pub fn simulate_peer_exchange() -> Result<(HandshakeResult, String), String> {
     if secrets.fingerprint != server_secrets.fingerprint {
         return Err("fingerprint mismatch in simulated exchange".into());
     }
+    let psk = pqc::derive_wg_psk(&secrets.session_key);
+    let server_psk = pqc::derive_wg_psk(&server_secrets.session_key);
+    if psk != server_psk {
+        return Err("PSK derivation mismatch between peers".into());
+    }
     let conf = render_wg_conf(
         &wg.private_b64,
         "10.66.66.2",
@@ -345,8 +432,10 @@ pub fn simulate_peer_exchange() -> Result<(HandshakeResult, String), String> {
         "127.0.0.1:51820",
         "10.66.66.1/32",
         Some("1.1.1.1"),
+        Some(&psk),
     );
     assert!(conf.contains("PrivateKey ="));
+    assert!(conf.contains("PresharedKey ="));
     assert!(conf.contains("[Peer]"));
     Ok((pqc::to_handshake_result(&secrets), conf))
 }

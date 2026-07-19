@@ -35,6 +35,7 @@ export interface TunnelStatus {
   message: string;
   transport: "wireguard" | "handshake_only";
   routing: "peer_only" | "full_tunnel";
+  psk_fingerprint: string | null;
 }
 
 export interface MigrationDetail {
@@ -65,6 +66,7 @@ export const connectTunnel = (edgeUrl?: string, fullTunnel?: boolean) =>
     fullTunnel: fullTunnel ?? null,
   });
 export const disconnectTunnel = () => invoke<TunnelStatus>("disconnect_tunnel");
+export const bringUpTunnel = () => invoke<TunnelStatus>("bring_up_tunnel");
 export const tunnelStatus = () => invoke<TunnelStatus>("tunnel_status");
 export const applyRemediation = (findingId: string) =>
   invoke<string>("apply_remediation", { findingId });

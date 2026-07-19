@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   applyRemediation,
+  bringUpTunnel,
   connectTunnel,
   disconnectTunnel,
   Finding,
@@ -13,18 +14,18 @@ import {
   runScan,
   setSetting,
   TunnelStatus,
+  tunnelStatus,
 } from "./api";
 import Lattice from "./Lattice";
 import Technical from "./Technical";
 
-type ShieldState = "exposed" | "negotiating" | "protected";
+type ShieldState = "exposed" | "negotiating" | "config_ready" | "protected";
 type Tab = "shield" | "assets" | "technical" | "log" | "settings";
 
 /** Concrete fix steps for findings the app cannot safely change itself. */
 const GUIDANCE: [string, string][] = [
   ["disk:filevault", "System Settings → Privacy & Security → FileVault → Turn On. Save the recovery key somewhere safe (not on this disk)."],
   ["os:version", "System Settings → General → Software Update. macOS 14+ ships hybrid post-quantum TLS."],
-  ["git:signing", "Switch to SSH signing: git config --global gpg.format ssh && git config --global user.signingkey ~/.ssh/cryptiq_ed25519.pub"],
   ["ssh:known_hosts", "Ask each server's admin to enable Ed25519 host keys (HostKey /etc/ssh/ssh_host_ed25519_key), then reconnect to refresh the entry."],
   ["gpg:", "Generate a modern key: gpg --quick-generate-key \"You <you@email>\" ed25519 sign — then publish it and revoke the old key once contacts have switched."],
   ["keychain:", "Open Keychain Access, sort certificates by key size, delete ones you don't recognize; for ones tied to an app, ask that vendor to reissue."],
@@ -32,6 +33,13 @@ const GUIDANCE: [string, string][] = [
 
 const guidanceFor = (id: string) =>
   GUIDANCE.find(([prefix]) => id.startsWith(prefix))?.[1] ?? null;
+
+const shieldFromTunnel = (status: TunnelStatus): ShieldState => {
+  if (status.state === "up" && status.transport === "wireguard") return "protected";
+  if (status.state === "handshaking") return "negotiating";
+  if (status.state === "config_ready" || status.handshake) return "config_ready";
+  return "exposed";
+};
 
 const STATE_COPY: Record<ShieldState, { word: string; sub: string }> = {
   exposed: {
@@ -42,9 +50,13 @@ const STATE_COPY: Record<ShieldState, { word: string; sub: string }> = {
     word: "Negotiating",
     sub: "Running the hybrid handshake: ML-KEM-768 lattice encapsulation combined with X25519. Both must be broken to recover your session key.",
   },
+  config_ready: {
+    word: "Ready",
+    sub: "Post-quantum handshake succeeded and a WireGuard config with an ML-KEM-derived PresharedKey is on disk. Authorize bringing the interface up to route traffic through the tunnel.",
+  },
   protected: {
     word: "Protected",
-    sub: "Hybrid post-quantum session established with the CryptiQ edge. Your control-plane key exchange is ML-KEM-768 + X25519; WireGuard carries the data plane.",
+    sub: "Tunnel is up. ML-KEM-768 + X25519 handshake, with the ML-KEM secret mixed into WireGuard's key schedule — decrypting your traffic requires breaking both lattice and elliptic-curve crypto.",
   },
 };
 
@@ -64,6 +76,7 @@ export default function App() {
   const [localOnly, setLocalOnly] = useState(true);
   const [autoQueue, setAutoQueue] = useState(false);
   const [fullTunnel, setFullTunnel] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
   const [onboardStep, setOnboardStep] = useState<number | null>(null);
 
   const scan = useCallback(async () => {
@@ -107,6 +120,15 @@ export default function App() {
     getSetting("full_tunnel")
       .then((v) => setFullTunnel(v === "1"))
       .catch(() => {});
+    tunnelStatus()
+      .then((status) => {
+        if (status.state !== "down") {
+          setTunnel(status);
+          setHandshake(status.handshake);
+          setShield(shieldFromTunnel(status));
+        }
+      })
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -116,20 +138,19 @@ export default function App() {
   };
 
   const connect = async () => {
-    if (shield === "protected" || shield === "negotiating") {
-      if (shield === "protected") {
-        try {
-          await disconnectTunnel();
-        } catch {
-          /* ignore */
-        }
-        setShield("exposed");
-        setHandshake(null);
-        setTunnel(null);
-        setTunnelError(null);
+    if (shield === "protected" || shield === "config_ready") {
+      try {
+        await disconnectTunnel();
+      } catch {
+        /* ignore */
       }
+      setShield("exposed");
+      setHandshake(null);
+      setTunnel(null);
+      setTunnelError(null);
       return;
     }
+    if (shield === "negotiating") return;
     setShield("negotiating");
     setTunnelError(null);
     try {
@@ -137,11 +158,22 @@ export default function App() {
       const status = await connectTunnel(edgeUrl, fullTunnel);
       setTunnel(status);
       setHandshake(status.handshake);
-      // config_ready still counts as protected for the PQ session; transport may be pending
-      setShield("protected");
+      setShield(shieldFromTunnel(status));
     } catch (e) {
       setShield("exposed");
       setTunnelError(typeof e === "string" ? e : "Could not reach the CryptiQ edge");
+    }
+  };
+
+  const retryBringUp = async () => {
+    setTunnelError(null);
+    try {
+      const status = await bringUpTunnel();
+      setTunnel(status);
+      setHandshake(status.handshake);
+      setShield(shieldFromTunnel(status));
+    } catch (e) {
+      setTunnelError(typeof e === "string" ? e : "Could not bring up WireGuard");
     }
   };
 
@@ -168,17 +200,32 @@ export default function App() {
 
   const applyQueue = async () => {
     setApplying(true);
+    setApplyError(null);
+    const failed = new Set<string>();
+    let wifiJustApplied = false;
     try {
       for (const id of queue) {
         try {
           const msg = await applyRemediation(id);
           setApplied((m) => new Map(m).set(id, msg));
-        } catch {
-          /* leave in queue-visible failed state; manual items can't reach here */
+          if (id === "net:wifi") wifiJustApplied = true;
+        } catch (e) {
+          failed.add(id);
+          setApplyError(
+            typeof e === "string" ? e : `Failed to apply ${id}`
+          );
         }
       }
-      setQueue(new Set());
+      setQueue(failed);
       setLog(await getRemediationLog());
+      if (wifiJustApplied && shield === "exposed") {
+        // Policy requires the tunnel — offer to connect next.
+        setApplyError(
+          (prev) =>
+            (prev ? `${prev} · ` : "") +
+            "Wi-Fi policy on: connect the quantum-safe tunnel (full routing enforced)."
+        );
+      }
     } finally {
       setApplying(false);
     }
@@ -260,7 +307,7 @@ export default function App() {
               <h1 className="state-word">{STATE_COPY[shield].word}</h1>
               <p className="state-sub">{STATE_COPY[shield].sub}</p>
               {tunnelError && <p className="tunnel-error">{tunnelError}</p>}
-              {tunnel?.message && shield === "protected" && (
+              {tunnel?.message && (shield === "protected" || shield === "config_ready") && (
                 <p className="tunnel-msg">{tunnel.message}</p>
               )}
               <div className="hero-actions">
@@ -269,12 +316,17 @@ export default function App() {
                   onClick={connect}
                   disabled={shield === "negotiating"}
                 >
-                  {shield === "protected"
+                  {shield === "protected" || shield === "config_ready"
                     ? "Disconnect"
                     : shield === "negotiating"
                       ? "Negotiating with edge…"
                       : "Connect quantum-safe tunnel"}
                 </button>
+                {shield === "config_ready" && (
+                  <button className="btn-primary" onClick={retryBringUp}>
+                    Authorize &amp; bring tunnel up
+                  </button>
+                )}
                 <button className="btn-ghost" onClick={() => setTab("assets")}>
                   {counts.critical + counts.warn} assets need attention
                 </button>
@@ -301,6 +353,14 @@ export default function App() {
                 <dt>Session fingerprint</dt>
                 <dd className={handshake ? "" : "dim"}>
                   {handshake?.session_fingerprint ?? "— no session —"}
+                </dd>
+              </div>
+              <div>
+                <dt>Data plane</dt>
+                <dd className={tunnel?.psk_fingerprint ? "" : "dim"}>
+                  {tunnel?.psk_fingerprint
+                    ? `PQ-hardened · ML-KEM PSK ${tunnel.psk_fingerprint}`
+                    : "— idle —"}
                 </dd>
               </div>
               <div>
@@ -366,6 +426,7 @@ export default function App() {
                 </div>
               );
             })}
+            {applyError && <p className="tunnel-error">{applyError}</p>}
             {queue.size > 0 && (
               <div className="queuebar">
                 <span className="qcount">

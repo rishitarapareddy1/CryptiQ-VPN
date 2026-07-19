@@ -1,8 +1,10 @@
-//! CryptiQ edge peer for local / staging use.
+//! CryptiQ edge peer for local / staging / production use.
 //!
-//! Serves the hybrid ML-KEM-768 + X25519 handshake, registers each client's
-//! WireGuard public key, and writes a server-side WireGuard config you can
-//! bring up with `sudo wg-quick up edge/wg-cryptiq.conf`.
+//! Serves the hybrid ML-KEM-768 + X25519 handshake, derives a WireGuard
+//! PresharedKey from the session, registers each client's WireGuard public
+//! key, and writes a server-side WireGuard config.
+//!
+//! Peers + PSKs persist across restarts in `$CRYPTIQ_EDGE_STATE_DIR/peers.json`.
 //!
 //! Run:  cargo run --manifest-path edge/Cargo.toml
 //! Bind: http://127.0.0.1:8787
@@ -23,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -43,14 +46,27 @@ struct Inner {
     wg_endpoint: String,
     dns: String,
     state_dir: PathBuf,
-    /// Outbound interface for NAT (e.g. eth0). When set, the generated server
-    /// config masquerades client traffic so full-tunnel clients reach the internet.
+    /// Outbound interface for NAT (e.g. eth0 / ens3). When set, the generated
+    /// server config masquerades client traffic so full-tunnel clients reach
+    /// the internet.
     nat_iface: Option<String>,
     /// Pending handshakes keyed by id.
     pending: HashMap<String, Pending>,
-    /// Registered peers: wg public key → assigned VPN IP.
-    peers: HashMap<String, String>,
+    /// Registered peers: wg public key → (assigned VPN IP, ML-KEM-derived PSK).
+    peers: HashMap<String, PeerEntry>,
     next_host: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PeerEntry {
+    vpn_ip: String,
+    psk_b64: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPeers {
+    next_host: u8,
+    peers: HashMap<String, PeerEntry>,
 }
 
 struct Pending {
@@ -103,14 +119,105 @@ fn fingerprint(key: &[u8; 32]) -> String {
         .join("")
 }
 
+/// Same derivation as the client's `pqc::derive_wg_psk`: mixing this into
+/// WireGuard's key schedule makes the data plane require breaking ML-KEM-768
+/// on top of Curve25519.
+fn derive_wg_psk(session_key: &[u8; 32]) -> String {
+    let mut kdf = Sha256::new();
+    kdf.update(b"cryptiq-wg-psk-v1");
+    kdf.update(session_key);
+    B64.encode(kdf.finalize())
+}
+
 fn wg_keypair() -> (String, String) {
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
     (B64.encode(secret.to_bytes()), B64.encode(public.as_bytes()))
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true, "service": "cryptiq-edge", "version": "0.5.0" }))
+fn peers_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("peers.json")
+}
+
+fn load_peers(state_dir: &Path) -> PersistedPeers {
+    let path = peers_path(state_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            eprintln!("warning: could not parse {}: {e}", path.display());
+            PersistedPeers {
+                next_host: 1,
+                peers: HashMap::new(),
+            }
+        }),
+        Err(_) => PersistedPeers {
+            next_host: 1,
+            peers: HashMap::new(),
+        },
+    }
+}
+
+fn save_peers(g: &Inner) -> Result<(), String> {
+    let persisted = PersistedPeers {
+        next_host: g.next_host,
+        peers: g.peers.clone(),
+    };
+    let path = peers_path(&g.state_dir);
+    let raw = serde_json::to_string_pretty(&persisted).map_err(|e| e.to_string())?;
+    std::fs::write(&path, raw).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Best-effort live reload of the WireGuard interface so new peers/PSKs take
+/// effect without waiting for the cron/timer. No-op if the interface is down.
+fn try_sync_wg_interface(conf: &Path) {
+    // Prefer the host helper installed by our deploy script.
+    if Path::new("/usr/local/bin/cryptiq-wg-sync").exists() {
+        let _ = Command::new("/usr/local/bin/cryptiq-wg-sync").status();
+        return;
+    }
+    // Fallback: if the interface is already up, strip + syncconf.
+    let iface = "wg-cryptiq";
+    let check = Command::new("ip")
+        .args(["link", "show", iface])
+        .output();
+    if !matches!(check, Ok(o) if o.status.success()) {
+        return;
+    }
+    let strip = Command::new("wg-quick").args(["strip", iface]).output();
+    if let Ok(stripped) = strip {
+        if stripped.status.success() {
+            let mut child = match Command::new("wg")
+                .args(["syncconf", iface, "/dev/stdin"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(&stripped.stdout);
+            }
+            let _ = child.wait();
+            let _ = conf; // conf path retained for logging callers
+        }
+    }
+}
+
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let g = state.inner.lock();
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "cryptiq-edge",
+        "version": "0.6.0",
+        "peers": g.peers.len(),
+        "pq_data_plane": true,
+    }))
 }
 
 async fn handshake_start(State(state): State<AppState>) -> impl IntoResponse {
@@ -175,21 +282,34 @@ async fn handshake_finish(
     let session_key = hybrid_kdf(ss_pq.as_slice(), ss_x.as_bytes());
     let fp = fingerprint(&session_key);
 
-    let client_ip = {
+    let psk = derive_wg_psk(&session_key);
+    let (client_ip, conf_path) = {
         let mut g = state.inner.lock();
-        if let Some(existing) = g.peers.get(&req.client_wg_pub_b64) {
-            existing.clone()
+        let ip = if let Some(existing) = g.peers.get(&req.client_wg_pub_b64) {
+            existing.vpn_ip.clone()
         } else {
             if g.next_host >= 250 {
                 return Err((StatusCode::SERVICE_UNAVAILABLE, "peer pool exhausted".into()));
             }
             g.next_host += 1;
-            let ip = format!("10.66.66.{}", g.next_host);
-            g.peers.insert(req.client_wg_pub_b64.clone(), ip.clone());
-            rewrite_server_conf(&g).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            ip
-        }
+            format!("10.66.66.{}", g.next_host)
+        };
+        // Fresh handshake ⇒ fresh PSK: always upsert so the server side
+        // matches the key the client just derived.
+        g.peers.insert(
+            req.client_wg_pub_b64.clone(),
+            PeerEntry {
+                vpn_ip: ip.clone(),
+                psk_b64: psk.clone(),
+            },
+        );
+        rewrite_server_conf(&g).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        save_peers(&g).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let conf = g.state_dir.join("wg-cryptiq.conf");
+        (ip, conf)
     };
+    // Live-reload outside the lock so we don't block other handshakes.
+    try_sync_wg_interface(&conf_path);
 
     let dns = state.inner.lock().dns.clone();
     Ok(Json(FinishRes {
@@ -230,13 +350,19 @@ fn rewrite_server_conf(g: &Inner) -> Result<(), String> {
         path.display(),
         g.server_wg_private_b64
     );
-    for (pub_key, ip) in &g.peers {
+    for (pub_key, peer) in &g.peers {
         body.push_str(&format!(
-            "[Peer]\nPublicKey = {pub_key}\nAllowedIPs = {ip}/32\n\n"
+            "[Peer]\nPublicKey = {pub_key}\nPresharedKey = {}\nAllowedIPs = {}/32\n\n",
+            peer.psk_b64, peer.vpn_ip
         ));
     }
     std::fs::write(&path, body).map_err(|e| e.to_string())?;
-    println!("wrote {}", path.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    println!("wrote {} ({} peers)", path.display(), g.peers.len());
     Ok(())
 }
 
@@ -278,6 +404,13 @@ async fn main() {
     let dns = std::env::var("CRYPTIQ_EDGE_DNS").unwrap_or_else(|_| "1.1.1.1".into());
     let nat_iface = std::env::var("CRYPTIQ_NAT_IFACE").ok().filter(|s| !s.is_empty());
 
+    let persisted = load_peers(&state_dir);
+    println!(
+        "loaded {} persisted peer(s); next_host={}",
+        persisted.peers.len(),
+        persisted.next_host
+    );
+
     let state = AppState {
         inner: Arc::new(Mutex::new(Inner {
             server_wg_private_b64: priv_b64,
@@ -287,16 +420,17 @@ async fn main() {
             state_dir,
             nat_iface,
             pending: HashMap::new(),
-            peers: HashMap::new(),
-            next_host: 1, // .2 onwards for clients
+            peers: persisted.peers,
+            next_host: persisted.next_host.max(1),
         })),
     };
 
-    // Write empty server conf so the ListenPort exists before first peer.
+    // Rewrite conf from persisted peers so a restart doesn't wipe PSKs.
     {
         let g = state.inner.lock();
         rewrite_server_conf(&g).expect("write initial wg conf");
     }
+    try_sync_wg_interface(&state.inner.lock().state_dir.join("wg-cryptiq.conf"));
 
     let app = Router::new()
         .route("/health", get(health))

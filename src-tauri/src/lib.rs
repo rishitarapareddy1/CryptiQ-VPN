@@ -30,12 +30,20 @@ fn connect_tunnel(
     full_tunnel: Option<bool>,
 ) -> Result<TunnelStatus, String> {
     let url = edge_url.or_else(|| store.get_setting("edge_url"));
-    let full = full_tunnel.unwrap_or_else(|| {
+    let mut full = full_tunnel.unwrap_or_else(|| {
         store
             .get_setting("full_tunnel")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false)
     });
+    // Wi-Fi policy: untrusted networks force full-tunnel routing.
+    if store
+        .get_setting("force_tunnel_untrusted")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        full = true;
+    }
     tunnels.connect(url, full)
 }
 
@@ -51,13 +59,24 @@ fn tunnel_status(tunnels: State<TunnelManager>) -> TunnelStatus {
 
 #[tauri::command]
 fn apply_remediation(store: State<Store>, finding_id: String) -> Result<String, String> {
-    if finding_id.starts_with("ssh:") {
+    if finding_id.starts_with("ssh:")
+        && finding_id != "ssh:known_hosts"
+        && finding_id != "ssh:none"
+    {
         migrate::apply_ssh_migration(&store, &finding_id)
     } else if finding_id == "net:wifi" {
         migrate::apply_wifi_policy(&store, &finding_id)
+    } else if finding_id == "git:signing" {
+        migrate::apply_git_signing(&store, &finding_id)
     } else {
         Err("This finding requires manual remediation".into())
     }
+}
+
+/// Retry bringing up an already-written WireGuard config (admin dialog).
+#[tauri::command]
+fn bring_up_tunnel(tunnels: State<TunnelManager>) -> Result<TunnelStatus, String> {
+    tunnels.bring_up()
 }
 
 #[tauri::command]
@@ -135,6 +154,7 @@ pub fn run() {
             establish_tunnel,
             connect_tunnel,
             disconnect_tunnel,
+            bring_up_tunnel,
             tunnel_status,
             apply_remediation,
             rollback_remediation,

@@ -244,11 +244,11 @@ fn scan_git_signing() -> Option<Finding> {
             id: "git:signing".into(),
             category: "Git".into(),
             name: "Git commit signing (GPG)".into(),
-            detail: "GPG keys are typically RSA — quantum-breakable signatures on your commits".into(),
+            detail: "GPG keys are typically RSA — quantum-breakable signatures on your commits. CryptiQ can switch Git to Ed25519 SSH signing.".into(),
             severity: "warn".into(),
             current_crypto: "GPG (likely RSA)".into(),
             target_crypto: "Ed25519 SSH signing".into(),
-            remediation: "manual".into(),
+            remediation: "auto".into(),
         })
     }
 }
