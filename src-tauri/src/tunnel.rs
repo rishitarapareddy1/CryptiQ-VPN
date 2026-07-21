@@ -341,18 +341,56 @@ pub fn render_wg_conf(
     )
 }
 
-fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
-    // wg-quick must exist; without wireguard-tools there is nothing to escalate to.
-    let wg_quick = ["/opt/homebrew/bin/wg-quick", "/usr/local/bin/wg-quick"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .ok_or("WireGuard tools not installed. Install with: brew install wireguard-tools")?;
+/// The app's own `resources/wireguard/` — bundled wg, wg-quick, wireguard-go,
+/// and a self-contained bash 4+ (with its Homebrew dylib deps re-pointed at
+/// `@executable_path/lib/` and re-signed; see resources/wireguard/THIRD_PARTY_NOTICES.md).
+/// This is what makes the tunnel work on a machine with no Homebrew at all.
+/// Only resolvable inside a real bundled .app — `current_exe()` under `cargo
+/// run` sits in target/debug/, which has no such directory, so dev builds
+/// fall through to the Homebrew/system search below unchanged.
+fn bundled_wireguard_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .join("Resources")
+        .join("resources")
+        .join("wireguard");
+    dir.join("wg-quick").exists().then_some(dir)
+}
 
-    // macOS ships bash 3 at /bin/bash; Homebrew wg-quick needs bash 4+.
-    let bash = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .unwrap_or("/bin/bash");
+fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
+    let bundled = bundled_wireguard_dir();
+
+    // wg-quick must exist; without wireguard-tools (bundled or Homebrew)
+    // there is nothing to escalate to.
+    let wg_quick: PathBuf = match &bundled {
+        Some(dir) => dir.join("wg-quick"),
+        None => ["/opt/homebrew/bin/wg-quick", "/usr/local/bin/wg-quick"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .ok_or("WireGuard tools not installed. Install with: brew install wireguard-tools")?,
+    };
+
+    // macOS ships bash 3 at /bin/bash; wg-quick needs bash 4+ (associative
+    // arrays). Bundled bash is self-contained; Homebrew's is the dev fallback.
+    let bash: PathBuf = match &bundled {
+        Some(dir) => dir.join("bash"),
+        None => ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("/bin/bash")),
+    };
+
+    // wg-quick shells out to bare `wg` and `wireguard-go` by name — put
+    // whichever directory we resolved above first on PATH so it finds our
+    // copies (bundled or Homebrew) instead of requiring a system install.
+    let path_prefix = bundled
+        .as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "/opt/homebrew/bin:/usr/local/bin".to_string());
 
     // Copy to a name wg-quick accepts as an interface name (no path weirdness).
     // On macOS, wg-quick expects the interface name from the filename stem.
@@ -366,10 +404,12 @@ fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
 
     // First try without escalation (works when already root, e.g. CLI/tests
     // run under sudo). wg-quick needs root, so from the GUI this will fail.
-    let direct = Command::new(bash)
-        .arg(wg_quick)
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    let direct = Command::new(&bash)
+        .arg(&wg_quick)
         .arg(action)
         .arg(&iface_conf)
+        .env("PATH", format!("{path_prefix}:{system_path}"))
         .output();
     if let Ok(o) = &direct {
         if o.status.success() {
@@ -380,7 +420,9 @@ fn run_wg_quick(action: &str, conf: &Path) -> Result<(), String> {
     // Escalate through the native macOS admin-password dialog. This is the
     // path a GUI app is supposed to use — no terminal, no silent sudo failure.
     let shell_cmd = format!(
-        "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin '{bash}' '{wg_quick}' {action} '{}'",
+        "PATH={path_prefix}:/usr/bin:/bin:/usr/sbin:/sbin '{}' '{}' {action} '{}'",
+        bash.display(),
+        wg_quick.display(),
         iface_conf.display()
     );
     let verb = if action == "up" { "start" } else { "stop" };

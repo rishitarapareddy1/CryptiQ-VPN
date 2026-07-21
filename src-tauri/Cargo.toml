@@ -1,6 +1,6 @@
 [package]
 name = "cryptiq-personal"
-version = "0.6.0"
+version = "0.7.0"
 description = "CryptiQ Personal — quantum-safe protection for your laptop"
 edition = "2021"
 
