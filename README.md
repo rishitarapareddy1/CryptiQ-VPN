@@ -7,7 +7,7 @@ one-click rollback.
 
 ## Download
 
-**[CryptiQ Personal 0.7.0 (.dmg)](https://github.com/rishitarapareddy1/CryptiQ-VPN/releases/latest/download/CryptiQ-Personal-0.7.0.dmg)**
+**[CryptiQ Personal 0.7.1 (.dmg)](https://github.com/rishitarapareddy1/CryptiQ-VPN/releases/latest/download/CryptiQ-Personal-0.7.1.dmg)**
 
 - macOS 12+ on **Apple Silicon** (the bundled WireGuard binaries are arm64 only).
 - WireGuard ships inside the app — no Homebrew, no separate install.
@@ -18,7 +18,7 @@ The app points at the hosted CryptiQ edge (`http://64.181.224.148:8787`) by
 default, so the tunnel works out of the box. You can change the edge URL in
 Settings, including to a local one you run yourself (see below).
 
-## What works in this build (0.7.0)
+## What works in this build (0.7.1)
 
 ### Tunnel
 - **Networked hybrid handshake** with a CryptiQ edge: ML-KEM-768 + X25519 over
