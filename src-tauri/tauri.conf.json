@@ -40,7 +40,9 @@
       "resources/wireguard/lib/*"
     ],
     "macOS": {
-      "minimumSystemVersion": "12.0"
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-",
+      "hardenedRuntime": false
     }
   }
 }
